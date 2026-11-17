@@ -53,17 +53,22 @@ MAX_KEY_TRANSFERS = 3
 
 SEETG_TOKEN = os.getenv("SEETG_TOKEN", "")
 SEETG_BASE_URL = "https://kartoshka.free/v1"
-SEETG_REQUEST_DELAY = 3.0
+SEETG_REQUEST_DELAY = 0.8
 
 SESSION_NAME = "telethon_market_userbot"
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 
 # Скорость работы (медленный, экономный режим)
-MONITOR_INTERVAL = 45       # Пауза между кругами обхода (сек)
-MONITOR_PAGE_LIMIT = 1      # Проверять только 1 самый свежий лот с модели за круг
-MONITOR_API_DELAY = 1.8     # Задержка запросов Telethon (сек)
-MONITOR_SEND_DELAY = 0.5    # Пауза между отправкой сообщений в чат (сек)
-MODEL_STEP_DELAY = 2.5      # Пауза при переходе к следующей модели (сек)
+# Настройки API see.tg (kartoshka.free)
+  # Было 3.0 сек — с балансом TON безопасно ускорить до 0.8 сек
+
+# Скорость работы (сбалансированный быстрый режим)
+MONITOR_INTERVAL = 15       # Было 45 сек — пауза между кругами обхода (сек)
+MONITOR_PAGE_LIMIT = 2      # Было 1 — проверять 2 самых свежих лота с модели за круг
+MONITOR_API_DELAY = 0.8     # Было 1.8 сек — задержка запросов Telethon (сек)
+MONITOR_SEND_DELAY = 0.35   # Было 0.5 сек — пауза между отправкой сообщений в чат (сек)
+MODEL_STEP_DELAY = 0.8      # Было 2.5 сек — пауза при переходе к следующей модели (сек)
+# Пауза при переходе к следующей модели (сек)
 
 # Фильтры по умолчанию (настроены на обычных юзеров с 1-3 подарками)
 DEFAULT_MAX_NFT_GIFTS = 3        # Максимум NFT-подарков в профиле
