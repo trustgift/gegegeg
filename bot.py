@@ -33,6 +33,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import (
     FloodWaitError,
+    PhoneMigrateError,
     SessionPasswordNeededError,
     AuthKeyUnregisteredError,
     PhoneCodeInvalidError,
@@ -535,9 +536,6 @@ def username_matches(owner: OwnerInfo) -> bool:
 
 
 def owner_passes_target_filters(owner: OwnerInfo) -> tuple[bool, str]:
-    if time.time() < profile_flood_until and owner.total_gifts_count == 0 and owner.nft_gifts_count == 0 and owner.rating_level == 0:
-        return True, "flood_bypass"
-
     max_nft = safe_int(MONITOR_SETTINGS.get("max_owner_nft_gifts"), 0)
     max_total = safe_int(MONITOR_SETTINGS.get("max_owner_total_gifts"), 0)
     max_rating = safe_int(MONITOR_SETTINGS.get("max_rating_level"), 0)
@@ -868,7 +866,7 @@ async def fetch_user_nft_gifts_count(user_id: int, max_to_check: int = 10) -> in
     except FloodWaitError as e:
         wait_time = int(e.seconds) + 1
         profile_flood_until = time.time() + wait_time
-        log.warning("FloodWait на проверку NFT (%s сек). Пропускаем профили до разбана.", wait_time)
+        log.warning("FloodWait на проверку NFT (%s сек). Ставим парсинг профилей на паузу.", wait_time)
         return 0
     except Exception as e:
         log.warning("Ошибка подсчёта NFT для %s: %s", user_id, e)
@@ -925,13 +923,9 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
                 rating_stars=cached.get("rating_stars", 0),
             )
 
+        # Если на аккаунте временный FloodWait на просмотр профилей — не пропускаем непроверенных юзеров
         if time.time() < profile_flood_until:
-            return OwnerInfo(
-                key=f"username:{seetg_username.lower()}" if seetg_username else f"id:{owner_id}",
-                label=f"@{seetg_username}" if seetg_username else f"id:{owner_id}",
-                username=seetg_username,
-                user_id=owner_id,
-            )
+            return None
 
         try:
             await ensure_user_client_connected()
@@ -1010,23 +1004,11 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
         except FloodWaitError as e:
             wait_time = int(e.seconds) + 1
             profile_flood_until = time.time() + wait_time
-            log.warning("FloodWait при запросе профиля %s (%s сек). Переходим в режим see.tg без проверки профиля до разбана.", owner_id, wait_time)
-            return OwnerInfo(
-                key=f"username:{seetg_username.lower()}" if seetg_username else f"id:{owner_id}",
-                label=f"@{seetg_username}" if seetg_username else f"id:{owner_id}",
-                username=seetg_username,
-                user_id=owner_id,
-            )
+            log.warning("FloodWait при запросе профиля %s (%s сек). Ставим парсинг новых лотов на паузу до разбана.", owner_id, wait_time)
+            return None
 
         except Exception as e:
-            log.warning("Telethon не открыл профиль %s (%s), используем данные из see.tg", owner_id, e)
-            if seetg_username:
-                return OwnerInfo(
-                    key=f"username:{seetg_username.lower()}",
-                    label=f"@{seetg_username}",
-                    username=seetg_username,
-                    user_id=owner_id,
-                )
+            log.warning("Telethon не открыл профиль %s (%s)", owner_id, e)
             return None
 
     return None
@@ -1102,13 +1084,8 @@ async def send_monitor_gift(market_gift: MarketGift, base_gift: BaseGift) -> boo
 
     owner = market_gift.owner
     num_line = f" #{market_gift.num}" if market_gift.num else ""
-
-    if time.time() < profile_flood_until and owner.total_gifts_count == 0 and owner.nft_gifts_count == 0:
-        rating_display = "скрыто (лимит TG)"
-        profile_line = "проверка профиля на паузе"
-    else:
-        rating_display = str(owner.rating_level) if owner.rating_level > 0 else "0 / новый"
-        profile_line = f"{owner.nft_gifts_count} NFT (всего: {owner.total_gifts_count} шт.)"
+    rating_display = str(owner.rating_level) if owner.rating_level > 0 else "0 / новый"
+    profile_line = f"{owner.nft_gifts_count} NFT (всего: {owner.total_gifts_count} шт.)"
 
     public_text = (
         "🚨 <b>НОВЫЙ ЛОГ (STARS)</b>\n\n"
@@ -1163,6 +1140,10 @@ async def send_monitor_gift(market_gift: MarketGift, base_gift: BaseGift) -> boo
 async def process_monitor_model(base_gift: BaseGift, first_scan: bool) -> int:
     sent_count = 0
 
+    # Если Telegram временно забанил просмотр профилей — не тратим баланс see.tg и не шлём непроверенных юзеров
+    if not first_scan and time.time() < profile_flood_until:
+        return 0
+
     try:
         result = await get_resale_page(
             gift_id=base_gift.gift_id,
@@ -1192,7 +1173,8 @@ async def process_monitor_model(base_gift: BaseGift, first_scan: bool) -> int:
 
             owner = await resolve_owner_info(raw)
             if not owner:
-                SENT_GIFTS[slug] = {"skipped": "hidden_or_blockchain", "gift_id": base_gift.gift_id}
+                if time.time() >= profile_flood_until:
+                    SENT_GIFTS[slug] = {"skipped": "hidden_or_unavailable", "gift_id": base_gift.gift_id}
                 continue
 
             if not username_matches(owner) or is_owner_blacklisted(owner):
@@ -1246,6 +1228,8 @@ async def monitor_cycle(first_scan: bool = False) -> int:
         total_sent = 0
         for index, model in enumerate(models, 1):
             if not MONITOR_SETTINGS.get("enabled"):
+                break
+            if not first_scan and time.time() < profile_flood_until:
                 break
             try:
                 sent = await process_monitor_model(model, first_scan)
@@ -1464,7 +1448,12 @@ def monitor_status_text() -> str:
     total_info = f"максимум {max_total} шт." if max_total > 0 else "выключен"
 
     flood_rem = max(0, int(profile_flood_until - time.time()))
-    flood_line = f"\n⚠️ FloodWait профилей TG: <b>ещё {flood_rem // 60} мин.</b>" if flood_rem > 0 else ""
+    flood_line = (
+        f"\n⏸ <b>ПАУЗА (FloodWait профилей TG): ещё {flood_rem // 60} мин.</b>\n"
+        "<i>(Смените аккаунт в Админ-панели, чтобы продолжить без ожидания)</i>"
+        if flood_rem > 0
+        else ""
+    )
 
     return (
         "📡 <b>АВТОМАТИЧЕСКИЙ МОНИТОРИНГ (ОБЩИЙ ЧАТ)</b>\n\n"
@@ -1935,8 +1924,38 @@ async def claim_log_callback(callback: CallbackQuery):
 
 
 # ============================================================
-# АДМИНСКИЕ КОМАНДЫ И АВТОРИЗАЦИЯ TELETHON
+# АДМИНСКИЕ КОМАНДЫ И УНИВЕРСАЛЬНАЯ АВТОРИЗАЦИЯ TELETHON (DC 1-5)
 # ============================================================
+
+async def reset_and_prepare_new_session() -> None:
+    """Останавливает монитор, разрывает старую сессию и создаёт чистый клиент под любой DC."""
+    global user_client, profile_flood_until
+    await stop_monitor()
+    profile_flood_until = 0.0
+    try:
+        if user_client.is_connected():
+            await user_client.disconnect()
+    except Exception:
+        pass
+    user_client = TelegramClient(StringSession(), API_ID, API_HASH)
+    await user_client.connect()
+
+
+async def finalize_new_session(message: Message) -> None:
+    """Сохраняет новую StringSession в PostgreSQL и выводит её админу."""
+    session_str = user_client.session.save() if isinstance(user_client.session, StringSession) else ""
+    if session_str:
+        schedule_db_save("telethon_session", {"session": session_str}, immediate=True)
+
+    dc_id = getattr(user_client.session, "dc_id", "?")
+    await message.answer(
+        f"✅ <b>Сессия (DC {dc_id}) успешно подключена и сохранена в PostgreSQL!</b>\n"
+        "Загружаю модели подарков...",
+        parse_mode="HTML",
+    )
+    await load_base_gifts()
+    await message.answer(f"Готово. Доступно моделей: {len(BASE_GIFTS)}", reply_markup=admin_main_keyboard())
+
 
 @dp.message(Command("set_target_chat"))
 async def set_target_chat(message: Message):
@@ -1952,11 +1971,13 @@ async def add_session_command(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
     await state.clear()
-    if await is_user_client_authorized():
-        await message.answer("✅ Сессия уже подключена.")
-        return
     await state.set_state(AuthState.waiting_phone)
-    await message.answer("📱 Введи номер телефона аккаунта Telethon (например: <code>+79991234567</code>):\n❌ Отмена — /cancel", parse_mode="HTML")
+    await message.answer(
+        "📱 <b>Подключение / смена аккаунта (поддерживаются все DC 1–5)</b>\n\n"
+        "Введи номер телефона (например: <code>+79991234567</code>):\n"
+        "❌ Отмена — /cancel",
+        parse_mode="HTML",
+    )
 
 
 @dp.message(AuthState.waiting_phone)
@@ -1970,14 +1991,21 @@ async def auth_phone(message: Message, state: FSMContext):
         return
 
     phone = "+" + digits
-    await ensure_user_client_connected()
     try:
-        sent_code = await user_client.send_code_request(phone)
+        await reset_and_prepare_new_session()
+        try:
+            sent_code = await user_client.send_code_request(phone)
+        except PhoneMigrateError as e:
+            log.info("Аккаунт %s находится на DC %s, переключаем дата-центр...", phone, e.new_dc)
+            await user_client._switch_dc(e.new_dc)
+            sent_code = await user_client.send_code_request(phone)
+
         await state.update_data(phone=phone, phone_code_hash=sent_code.phone_code_hash)
         await state.set_state(AuthState.waiting_code)
+        dc_id = getattr(user_client.session, "dc_id", "?")
         await message.answer(
-            "✅ Код подтверждения отправлен в Telegram.\n"
-            "⚠️ Вводи код <b>с пробелом</b> (например: <code>12 345</code>), чтобы Telegram не заблокировал его за пересылку:",
+            f"✅ Код отправлен (<b>DC {dc_id}</b>).\n"
+            "⚠️ Вводи код <b>с пробелом</b> (например: <code>12 345</code>), чтобы Telegram не заблокировал его:",
             parse_mode="HTML",
         )
     except Exception as e:
@@ -2008,11 +2036,7 @@ async def auth_code(message: Message, state: FSMContext):
             phone_code_hash=data.get("phone_code_hash"),
         )
         await state.clear()
-        session_str = user_client.session.save() if isinstance(user_client.session, StringSession) else ""
-        msg_extra = f"\n\n🔑 Строка для <code>TELETHON_SESSION</code> (сохрани в ENV хостинга):\n<code>{session_str}</code>" if session_str else ""
-        await message.answer(f"✅ Сессия авторизована! Загружаю модели...{msg_extra}", parse_mode="HTML")
-        await load_base_gifts()
-        await message.answer(f"Готово. Доступно моделей: {len(BASE_GIFTS)}", reply_markup=admin_main_keyboard())
+        await finalize_new_session(message)
     except SessionPasswordNeededError:
         await state.set_state(AuthState.waiting_password)
         await message.answer("🔐 На аккаунте включён 2FA. Введи облачный пароль:")
@@ -2029,11 +2053,7 @@ async def auth_password(message: Message, state: FSMContext):
     try:
         await user_client.sign_in(password=(message.text or "").strip())
         await state.clear()
-        session_str = user_client.session.save() if isinstance(user_client.session, StringSession) else ""
-        msg_extra = f"\n\n🔑 Строка для <code>TELETHON_SESSION</code> (сохрани в ENV хостинга):\n<code>{session_str}</code>" if session_str else ""
-        await message.answer(f"✅ 2FA успешно пройдена! Загружаю модели...{msg_extra}", parse_mode="HTML")
-        await load_base_gifts()
-        await message.answer(f"Готово. Загружено моделей: {len(BASE_GIFTS)}", reply_markup=admin_main_keyboard())
+        await finalize_new_session(message)
     except Exception as e:
         await message.answer(f"❌ Неверный пароль: {e}")
 
@@ -2438,7 +2458,8 @@ async def admin_panel(callback: CallbackQuery):
         return
     is_auth = await is_user_client_authorized()
     me = await user_client.get_me() if is_auth else None
-    account = f"{me.first_name} (@{me.username})" if me else "—"
+    dc_id = getattr(user_client.session, "dc_id", "?")
+    account = f"{me.first_name} (@{me.username}) [DC {dc_id}]" if me else "—"
 
     lifetime_count = sum(1 for u in SUBSCRIPTIONS["users"].values() if u.get("plan") == "lifetime")
     trial_count = sum(1 for u in SUBSCRIPTIONS["users"].values() if u.get("plan") == "trial")
@@ -2458,7 +2479,7 @@ async def admin_panel(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")],
+                [InlineKeyboardButton(text="🔄 СМЕНИТЬ / ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")],
                 [InlineKeyboardButton(text="🔄 ОБНОВИТЬ МОДЕЛИ", callback_data="reload_models")],
                 [InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")],
             ]
@@ -2482,7 +2503,12 @@ async def add_session_btn(callback: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await state.set_state(AuthState.waiting_phone)
-    await callback.message.answer("📱 Введи номер телефона (пример: <code>+79991234567</code>):\n❌ Отмена — /cancel", parse_mode="HTML")
+    await callback.message.answer(
+        "📱 <b>Подключение / смена аккаунта (поддерживаются все DC 1–5)</b>\n\n"
+        "Введи номер телефона (например: <code>+79991234567</code>):\n"
+        "❌ Отмена — /cancel",
+        parse_mode="HTML",
+    )
     await callback.answer()
 
 
@@ -2491,10 +2517,17 @@ async def add_session_btn(callback: CallbackQuery, state: FSMContext):
 # ============================================================
 
 async def main():
-    global OWNERS_BLACKLIST, OWNER_CACHE, SEETG_CACHE, SENT_GIFTS, CLAIMED_LOGS, SUBSCRIPTIONS, http_session, trial_watcher_task
+    global OWNERS_BLACKLIST, OWNER_CACHE, SEETG_CACHE, SENT_GIFTS, CLAIMED_LOGS, SUBSCRIPTIONS, http_session, trial_watcher_task, user_client
 
     validate_config()
     await init_db()
+
+    # Загружаем сохранённую StringSession из PostgreSQL (приоритет над ENV, если сессию меняли через бота)
+    saved_session_obj = await db_get("telethon_session", {})
+    db_session_str = saved_session_obj.get("session", "").strip() if isinstance(saved_session_obj, dict) else ""
+    active_session_str = db_session_str or TELETHON_SESSION
+    if active_session_str:
+        user_client = TelegramClient(StringSession(active_session_str), API_ID, API_HASH)
 
     OWNERS_BLACKLIST = await db_get("owner_blacklist", {})
     OWNER_CACHE = await db_get("owner_cache", {})
@@ -2524,12 +2557,13 @@ async def main():
 
     if await is_user_client_authorized():
         me = await user_client.get_me()
-        log.info("Сессия Telethon активна: %s (@%s)", me.first_name, me.username)
+        dc_id = getattr(user_client.session, "dc_id", "?")
+        log.info("Сессия Telethon активна: %s (@%s) [DC %s]", me.first_name, me.username, dc_id)
         await ensure_models_loaded()
         if MONITOR_SETTINGS.get("enabled") and get_target_chat_id() and MONITOR_SETTINGS.get("model_ids"):
             await start_monitor()
     else:
-        log.warning("Сессия Telethon не авторизована. Напиши боту /add_session или задай TELETHON_SESSION")
+        log.warning("Сессия Telethon не авторизована. Напиши боту /add_session или нажми кнопку в Админ-панели.")
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
