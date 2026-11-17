@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
 import aiohttp
+import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
@@ -23,6 +24,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.errors import (
     FloodWaitError,
     SessionPasswordNeededError,
@@ -35,42 +37,45 @@ from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import PeerUser
 
 
-
+# ============================================================
+# CONFIG (ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ХОСТИНГА)
+# ============================================================
 
 API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+API_HASH = os.getenv("API_HASH", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TELETHON_SESSION = os.getenv("TELETHON_SESSION", "").strip()
 
-
+# Админы через запятую в ENV: ADMIN_IDS=1602809044,123456789
 ADMIN_IDS: Set[int] = {
     int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 }
 
-TON_WALLET_ADDRESS = os.getenv("TON_WALLET_ADDRESS", "")
-SUBSCRIPTION_PRICE_TON = int(os.getenv("SUBSCRIPTION_PRICE_TON", "5"))
-TRIAL_DURATION_SECONDS = 30 * 60
-MAX_KEY_TRANSFERS = 3
+# База данных PostgreSQL (вставь ссылку в переменную DATABASE_URL на bothost.ru)
+RAW_DB_URL = os.getenv("DATABASE_URL", "").strip()
+DATABASE_URL = RAW_DB_URL.replace("Postgresql://", "postgresql://").replace("postgres://", "postgresql://")
 
-SEETG_TOKEN = os.getenv("SEETG_TOKEN", "")
+TON_WALLET_ADDRESS = os.getenv("TON_WALLET_ADDRESS", "").strip()
+SUBSCRIPTION_PRICE_TON = int(os.getenv("SUBSCRIPTION_PRICE_TON", "5"))
+TRIAL_DURATION_SECONDS = 30 * 60  # 30 минут
+MAX_KEY_TRANSFERS = 3             # Максимум переносов подписки по ключу
+
+# Настройки API see.tg (kartoshka.free)
+SEETG_TOKEN = os.getenv("SEETG_TOKEN", "").strip()
 SEETG_BASE_URL = "https://kartoshka.free/v1"
 SEETG_REQUEST_DELAY = 0.8
 
 SESSION_NAME = "telethon_market_userbot"
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 
-# Скорость работы (медленный, экономный режим)
-# Настройки API see.tg (kartoshka.free)
-  # Было 3.0 сек — с балансом TON безопасно ускорить до 0.8 сек
+# Скорость работы (сбалансированный быстрый режим без частых FloodWait)
+MONITOR_INTERVAL = 15       # Пауза между кругами обхода (сек)
+MONITOR_PAGE_LIMIT = 2      # Проверять 2 самых свежих лота с модели за круг
+MONITOR_API_DELAY = 2.2     # Безопасная задержка запросов профилей в Telethon (сек)
+MONITOR_SEND_DELAY = 0.35   # Пауза между отправкой сообщений в чат (сек)
+MODEL_STEP_DELAY = 0.8      # Пауза при переходе к следующей модели (сек)
 
-# Скорость работы (сбалансированный быстрый режим)
-MONITOR_INTERVAL = 15       # Было 45 сек — пауза между кругами обхода (сек)
-MONITOR_PAGE_LIMIT = 2      # Было 1 — проверять 2 самых свежих лота с модели за круг
-MONITOR_API_DELAY = 0.8     # Было 1.8 сек — задержка запросов Telethon (сек)
-MONITOR_SEND_DELAY = 0.35   # Было 0.5 сек — пауза между отправкой сообщений в чат (сек)
-MODEL_STEP_DELAY = 0.8      # Было 2.5 сек — пауза при переходе к следующей модели (сек)
-# Пауза при переходе к следующей модели (сек)
-
-# Фильтры по умолчанию (настроены на обычных юзеров с 1-3 подарками)
+# Фильтры по умолчанию (обычные юзеры с 1-3 подарками)
 DEFAULT_MAX_NFT_GIFTS = 3        # Максимум NFT-подарков в профиле
 DEFAULT_MAX_TOTAL_GIFTS = 6      # Максимум ВСЕХ подарков в профиле (NFT + обычные)
 DEFAULT_MAX_RATING = 5           # Порог рейтинга (строго < 5, включая -1 и 0)
@@ -81,14 +86,6 @@ DEFAULT_USERNAME_MODE = "required"
 SEND_EXISTING_ON_FIRST_SCAN = False
 GIFTS_PER_PAGE = 8
 REQUEST_PAGE_LIMIT = 20
-
-OWNER_BLACKLIST_FILE = "owner_blacklist.json"
-OWNER_CACHE_FILE = "owner_cache.json"
-SEETG_CACHE_FILE = "seetg_cache.json"
-SENT_GIFTS_FILE = "sent_gifts.json"
-MONITOR_SETTINGS_FILE = "monitor_settings.json"
-SUBSCRIPTIONS_FILE = "subscriptions.json"
-CLAIMED_LOGS_FILE = "claimed_logs.json"
 
 
 # ============================================================
@@ -106,25 +103,30 @@ def validate_config():
     errors = []
     if not isinstance(API_ID, int) or API_ID <= 0:
         errors.append("API_ID")
-    if not API_HASH or API_HASH.startswith("ВСТАВЬ_"):
+    if not API_HASH:
         errors.append("API_HASH")
-    if not BOT_TOKEN or BOT_TOKEN.startswith("ВСТАВЬ_"):
+    if not BOT_TOKEN:
         errors.append("BOT_TOKEN")
-    if not SEETG_TOKEN or SEETG_TOKEN.startswith("12:AbCdEf"):
+    if not SEETG_TOKEN:
         errors.append("SEETG_TOKEN")
     if not ADMIN_IDS:
         errors.append("ADMIN_IDS")
     if errors:
         raise SystemExit(
-            "\nНе заполнены настройки: " + ", ".join(errors) +
-            "\nЗаполни блок CONFIG в верхней части скрипта."
+            "\nНе заполнены переменные окружения: " + ", ".join(errors) +
+            "\nДобавь их в настройках хостинга (ENV)."
         )
 
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-user_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+user_client = TelegramClient(
+    StringSession(TELETHON_SESSION) if TELETHON_SESSION else SESSION_NAME,
+    API_ID,
+    API_HASH,
+)
 http_session: Optional[aiohttp.ClientSession] = None
+db_pool: Optional[asyncpg.Pool] = None
 
 BASE_GIFTS: List["BaseGift"] = []
 BASE_GIFTS_BY_ID: Dict[int, "BaseGift"] = {}
@@ -133,36 +135,13 @@ OWNERS_BLACKLIST: Dict[str, str] = {}
 OWNER_CACHE: Dict[str, Dict[str, Any]] = {}
 SEETG_CACHE: Dict[str, Dict[str, Any]] = {}
 SENT_GIFTS: Dict[str, Dict[str, Any]] = {}
+CLAIMED_LOGS: Dict[str, Dict[str, Any]] = {}
 
-# Структура SUBSCRIPTIONS:
-# {
-#   "users": {
-#       "user_id_str": {
-#           "plan": "trial" | "lifetime",
-#           "expires_at": float | None,
-#           "trial_used": bool,
-#           "key": str | None,
-#           "kicked": bool
-#       }
-#   },
-#   "keys": {
-#       "KEY-...": {
-#           "owner_id": int,
-#           "transfers_left": int
-#       }
-#   },
-#   "pending_payments": {
-#       "user_id_str": {"username": str, "full_name": str, "created_at": float}
-#   }
-# }
 SUBSCRIPTIONS: Dict[str, Any] = {
     "users": {},
     "keys": {},
     "pending_payments": {},
 }
-
-# Логи, отправленные в группу и ожидающие захвата: slug -> данные лога
-CLAIMED_LOGS: Dict[str, Dict[str, Any]] = {}
 
 SEETG_BILLING: Dict[str, Any] = {
     "free_remaining": "?",
@@ -173,6 +152,7 @@ seetg_api_lock = asyncio.Lock()
 last_seetg_request = 0.0
 claim_lock = asyncio.Lock()
 subs_lock = asyncio.Lock()
+db_save_tasks: Dict[str, asyncio.Task] = {}
 
 MONITOR_SETTINGS: Dict[str, Any] = {
     "enabled": False,
@@ -193,6 +173,7 @@ monitor_first_scan_done = False
 monitor_lock = asyncio.Lock()
 market_api_lock = asyncio.Lock()
 last_market_api_request = 0.0
+profile_flood_until = 0.0  # Временный бан на GetFullUserRequest в Telethon
 
 
 # ============================================================
@@ -275,10 +256,10 @@ class KeyTransferState(StatesGroup):
 
 
 # ============================================================
-# JSON STORAGE
+# POSTGRESQL STORAGE (+ LOCAL JSON FALLBACK)
 # ============================================================
 
-def load_json(path: str, default: Any) -> Any:
+def load_local_json(path: str, default: Any) -> Any:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -286,95 +267,132 @@ def load_json(path: str, default: Any) -> Any:
         return default
 
 
-def save_json(path: str, data: Any) -> None:
+def save_local_json(path: str, data: Any) -> None:
     try:
         tmp = f"{path}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
     except Exception as e:
-        log.error("Save JSON error %s: %s", path, e)
+        log.error("Local JSON save error %s: %s", path, e)
 
 
-def load_owner_blacklist() -> Dict[str, str]:
-    data = load_json(OWNER_BLACKLIST_FILE, {})
-    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+async def init_db() -> None:
+    global db_pool
+    if not DATABASE_URL:
+        log.warning("DATABASE_URL не задан! Данные будут сохраняться только локально.")
+        return
+    try:
+        db_pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=5)
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_kv_store (
+                    key TEXT PRIMARY KEY,
+                    value JSONB NOT NULL,
+                    updated_at DOUBLE PRECISION NOT NULL
+                )
+                """
+            )
+        log.info("✅ Подключение к PostgreSQL успешно установлено!")
+    except Exception as e:
+        log.error("❌ Ошибка подключения к PostgreSQL: %s", e)
+        db_pool = None
+
+
+async def db_get(key: str, default: Any) -> Any:
+    if db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT value FROM bot_kv_store WHERE key = $1", key)
+                if row and row["value"] is not None:
+                    val = row["value"]
+                    return json.loads(val) if isinstance(val, str) else val
+        except Exception as e:
+            log.error("DB GET error [%s]: %s", key, e)
+    return load_local_json(f"{key}.json", default)
+
+
+async def _db_set_worker(key: str, data_json: str, immediate: bool = False) -> None:
+    if not immediate:
+        await asyncio.sleep(1.2)
+    if db_pool is None:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO bot_kv_store (key, value, updated_at)
+                VALUES ($1, $2::jsonb, $3)
+                ON CONFLICT (key) DO UPDATE
+                SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
+                """,
+                key,
+                data_json,
+                time.time(),
+            )
+    except Exception as e:
+        log.error("DB SET error [%s]: %s", key, e)
+
+
+def schedule_db_save(key: str, data: Any, immediate: bool = False) -> None:
+    save_local_json(f"{key}.json", data)
+    if db_pool is None:
+        return
+    data_json = json.dumps(data, ensure_ascii=False)
+    old_task = db_save_tasks.get(key)
+    if old_task and not old_task.done():
+        old_task.cancel()
+    db_save_tasks[key] = asyncio.create_task(_db_set_worker(key, data_json, immediate=immediate))
 
 
 def save_owner_blacklist() -> None:
-    save_json(OWNER_BLACKLIST_FILE, OWNERS_BLACKLIST)
-
-
-def load_owner_cache() -> Dict[str, Dict[str, Any]]:
-    data = load_json(OWNER_CACHE_FILE, {})
-    return {str(k): dict(v) for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
+    schedule_db_save("owner_blacklist", OWNERS_BLACKLIST, immediate=True)
 
 
 def save_owner_cache() -> None:
-    save_json(OWNER_CACHE_FILE, OWNER_CACHE)
-
-
-def load_seetg_cache() -> Dict[str, Dict[str, Any]]:
-    data = load_json(SEETG_CACHE_FILE, {})
-    return {str(k): dict(v) for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
+    if len(OWNER_CACHE) > 10000:
+        for k in list(OWNER_CACHE.keys())[:-8000]:
+            OWNER_CACHE.pop(k, None)
+    schedule_db_save("owner_cache", OWNER_CACHE)
 
 
 def save_seetg_cache() -> None:
-    if len(SEETG_CACHE) > 20000:
-        keys_to_remove = list(SEETG_CACHE.keys())[:-16000]
-        for k in keys_to_remove:
+    if len(SEETG_CACHE) > 15000:
+        for k in list(SEETG_CACHE.keys())[:-12000]:
             SEETG_CACHE.pop(k, None)
-    save_json(SEETG_CACHE_FILE, SEETG_CACHE)
-
-
-def load_sent_gifts() -> Dict[str, Dict[str, Any]]:
-    data = load_json(SENT_GIFTS_FILE, {})
-    return {str(k): v if isinstance(v, dict) else {} for k, v in data.items()} if isinstance(data, dict) else {}
+    schedule_db_save("seetg_cache", SEETG_CACHE)
 
 
 def save_sent_gifts() -> None:
-    if len(SENT_GIFTS) > 5000:
-        keys_to_remove = list(SENT_GIFTS.keys())[:-4000]
-        for k in keys_to_remove:
+    if len(SENT_GIFTS) > 4000:
+        for k in list(SENT_GIFTS.keys())[:-3000]:
             SENT_GIFTS.pop(k, None)
-    save_json(SENT_GIFTS_FILE, SENT_GIFTS)
-
-
-def load_subscriptions() -> None:
-    global SUBSCRIPTIONS
-    data = load_json(SUBSCRIPTIONS_FILE, {})
-    if isinstance(data, dict):
-        SUBSCRIPTIONS["users"] = data.get("users") if isinstance(data.get("users"), dict) else {}
-        SUBSCRIPTIONS["keys"] = data.get("keys") if isinstance(data.get("keys"), dict) else {}
-        SUBSCRIPTIONS["pending_payments"] = data.get("pending_payments") if isinstance(data.get("pending_payments"), dict) else {}
+    schedule_db_save("sent_gifts", SENT_GIFTS)
 
 
 def save_subscriptions() -> None:
-    save_json(SUBSCRIPTIONS_FILE, SUBSCRIPTIONS)
-
-
-def load_claimed_logs() -> Dict[str, Dict[str, Any]]:
-    data = load_json(CLAIMED_LOGS_FILE, {})
-    return {str(k): dict(v) for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
+    schedule_db_save("subscriptions", SUBSCRIPTIONS, immediate=True)
 
 
 def save_claimed_logs() -> None:
-    if len(CLAIMED_LOGS) > 3000:
-        keys_to_remove = list(CLAIMED_LOGS.keys())[:-2500]
-        for k in keys_to_remove:
+    if len(CLAIMED_LOGS) > 2000:
+        for k in list(CLAIMED_LOGS.keys())[:-1500]:
             CLAIMED_LOGS.pop(k, None)
-    save_json(CLAIMED_LOGS_FILE, CLAIMED_LOGS)
+    schedule_db_save("claimed_logs", CLAIMED_LOGS, immediate=True)
 
 
-def load_monitor_settings() -> None:
+def save_monitor_settings() -> None:
+    schedule_db_save("monitor_settings", MONITOR_SETTINGS, immediate=True)
+
+
+def apply_loaded_settings(data: Any) -> None:
     global MONITOR_SETTINGS
-
-    data = load_json(MONITOR_SETTINGS_FILE, {})
     if not isinstance(data, dict):
         data = {}
 
     MONITOR_SETTINGS["enabled"] = bool(data.get("enabled", False))
-    MONITOR_SETTINGS["target_chat_id"] = int(data.get("target_chat_id", TARGET_CHAT_ID) or 0)
+    MONITOR_SETTINGS["target_chat_id"] = int(data.get("target_chat_id", TARGET_CHAT_ID) or TARGET_CHAT_ID or 0)
     MONITOR_SETTINGS["min_price"] = max(0, int(data.get("min_price", DEFAULT_MIN_PRICE) or 0))
     MONITOR_SETTINGS["max_price"] = max(0, int(data.get("max_price", DEFAULT_MAX_PRICE) or 0))
     MONITOR_SETTINGS["max_owner_nft_gifts"] = max(0, int(data.get("max_owner_nft_gifts", DEFAULT_MAX_NFT_GIFTS) or 0))
@@ -392,10 +410,6 @@ def load_monitor_settings() -> None:
 
     if not MONITOR_SETTINGS["model_ids"]:
         MONITOR_SETTINGS["enabled"] = False
-
-
-def save_monitor_settings() -> None:
-    save_json(MONITOR_SETTINGS_FILE, MONITOR_SETTINGS)
 
 
 # ============================================================
@@ -491,6 +505,10 @@ def username_matches(owner: OwnerInfo) -> bool:
 
 
 def owner_passes_target_filters(owner: OwnerInfo) -> tuple[bool, str]:
+    # Если Telethon временно в FloodWait по профилям, данные профиля не заполнены — пропускаем лот без отсева
+    if time.time() < profile_flood_until and owner.total_gifts_count == 0 and owner.nft_gifts_count == 0 and owner.rating_level == 0:
+        return True, "flood_bypass"
+
     max_nft = safe_int(MONITOR_SETTINGS.get("max_owner_nft_gifts"), 0)
     max_total = safe_int(MONITOR_SETTINGS.get("max_owner_total_gifts"), 0)
     max_rating = safe_int(MONITOR_SETTINGS.get("max_rating_level"), 0)
@@ -552,7 +570,6 @@ async def kick_user_from_group(chat_id: int, user_id: int) -> bool:
     try:
         await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
         await asyncio.sleep(0.5)
-        # Разбаниваем сразу после кика, чтобы человек мог вернуться, если купит полную подписку
         await bot.unban_chat_member(chat_id=chat_id, user_id=user_id, only_if_banned=True)
         log.info("Пользователь %s исключён из группы %s", user_id, chat_id)
         return True
@@ -562,7 +579,6 @@ async def kick_user_from_group(chat_id: int, user_id: int) -> bool:
 
 
 async def trial_watcher_loop() -> None:
-    """Фоновый контроль окончания 30-минутных пробных подписок."""
     while True:
         try:
             await asyncio.sleep(15)
@@ -778,6 +794,10 @@ def is_nft_gift(obj: Any) -> bool:
 
 
 async def fetch_user_nft_gifts_count(user_id: int, max_to_check: int = 10) -> int:
+    global profile_flood_until
+    if time.time() < profile_flood_until:
+        return 0
+
     try:
         await pace_market_api()
         peer = await user_client.get_input_entity(user_id)
@@ -817,15 +837,17 @@ async def fetch_user_nft_gifts_count(user_id: int, max_to_check: int = 10) -> in
 
     except FloodWaitError as e:
         wait_time = int(e.seconds) + 1
-        log.warning("FloodWait при проверке NFT подарков: %s сек.", wait_time)
-        await asyncio.sleep(wait_time)
-        return 999
+        profile_flood_until = time.time() + wait_time
+        log.warning("FloodWait на проверку NFT (%s сек). Пропускаем профили до разбана.", wait_time)
+        return 0
     except Exception as e:
         log.warning("Ошибка подсчёта NFT для %s: %s", user_id, e)
         return 0
 
 
 async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
+    global profile_flood_until
+
     slug = str(get_field(raw_gift, "slug") or "")
     owner_id = extract_owner_id(get_field(raw_gift, "owner_id"))
     seetg_username: Optional[str] = None
@@ -871,6 +893,15 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
                 total_gifts_count=cached.get("total_gifts_count", 0),
                 rating_level=cached.get("rating_level", 0),
                 rating_stars=cached.get("rating_stars", 0),
+            )
+
+        # Если на аккаунте временный FloodWait на просмотр профилей — не спим 6 часов, отдаём данные из see.tg
+        if time.time() < profile_flood_until:
+            return OwnerInfo(
+                key=f"username:{seetg_username.lower()}" if seetg_username else f"id:{owner_id}",
+                label=f"@{seetg_username}" if seetg_username else f"id:{owner_id}",
+                username=seetg_username,
+                user_id=owner_id,
             )
 
         try:
@@ -949,8 +980,8 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
 
         except FloodWaitError as e:
             wait_time = int(e.seconds) + 1
-            log.warning("FloodWait при запросе профиля %s: %s сек.", owner_id, wait_time)
-            await asyncio.sleep(wait_time)
+            profile_flood_until = time.time() + wait_time
+            log.warning("FloodWait при запросе профиля %s (%s сек). Переходим в режим see.tg без проверки профиля до разбана.", owner_id, wait_time)
             return OwnerInfo(
                 key=f"username:{seetg_username.lower()}" if seetg_username else f"id:{owner_id}",
                 label=f"@{seetg_username}" if seetg_username else f"id:{owner_id}",
@@ -1013,7 +1044,7 @@ async def get_resale_page(
         except FloodWaitError as e:
             wait_time = int(e.seconds) + 1
             log.warning("FloodWait на запросе маркета: %s сек.", wait_time)
-            await asyncio.sleep(wait_time)
+            await asyncio.sleep(min(wait_time, 60))
 
 
 def is_stars_only_listing(raw_gift: Any) -> bool:
@@ -1024,7 +1055,7 @@ def is_stars_only_listing(raw_gift: Any) -> bool:
 
 
 # ============================================================
-# MONITORING LOGIC (БЕЗ ТОПИКОВ + КНОПКА "ЗАБРАТЬ ЛОГ")
+# MONITORING LOGIC (ОБЩИЙ ЧАТ + КНОПКА "ЗАБРАТЬ ЛОГ")
 # ============================================================
 
 async def get_monitor_models() -> List[BaseGift]:
@@ -1042,16 +1073,21 @@ async def send_monitor_gift(market_gift: MarketGift, base_gift: BaseGift) -> boo
 
     owner = market_gift.owner
     num_line = f" #{market_gift.num}" if market_gift.num else ""
-    rating_display = str(owner.rating_level) if owner.rating_level > 0 else "0 / новый"
 
-    # В группу отправляем карточку БЕЗ юзернейма продавца, чтобы забрать мог только один человек по кнопке
+    if time.time() < profile_flood_until and owner.total_gifts_count == 0 and owner.nft_gifts_count == 0:
+        rating_display = "скрыто (лимит TG)"
+        profile_line = "проверка профиля на паузе"
+    else:
+        rating_display = str(owner.rating_level) if owner.rating_level > 0 else "0 / новый"
+        profile_line = f"{owner.nft_gifts_count} NFT (всего: {owner.total_gifts_count} шт.)"
+
     public_text = (
         "🚨 <b>НОВЫЙ ЛОГ (STARS)</b>\n\n"
         f"🎁 <b>Подарок:</b> {escape_text(market_gift.title)}{num_line}\n"
         f"📦 <b>Модель:</b> {escape_text(base_gift.title)}\n"
         f"💰 <b>Цена:</b> {market_gift.price} ⭐\n"
         f"👑 <b>Рейтинг владельца:</b> {rating_display}\n"
-        f"🖼 <b>Профиль:</b> {owner.nft_gifts_count} NFT (всего: {owner.total_gifts_count} шт.)\n\n"
+        f"🖼 <b>Профиль:</b> {profile_line}\n\n"
         "👇 Нажми кнопку ниже, чтобы забрать контакт себе в ЛС:"
     )
 
@@ -1165,7 +1201,7 @@ async def process_monitor_model(base_gift: BaseGift, first_scan: bool) -> int:
     except FloodWaitError as e:
         wait_time = int(e.seconds) + 1
         log.warning("FloodWait в мониторе для %s: %s сек.", base_gift.title, wait_time)
-        await asyncio.sleep(wait_time)
+        await asyncio.sleep(min(wait_time, 60))
     except Exception as e:
         log.exception("Ошибка проверки модели %s: %s", base_gift.title, e)
 
@@ -1206,7 +1242,7 @@ async def monitor_loop() -> None:
     monitor_first_scan_done = False
 
     log.info(
-        "Монитор запущен (медленный режим: %s сек). Рейтинг <%s, Макс. NFT: %s, Макс. всего: %s",
+        "Монитор запущен (интервал: %s сек). Рейтинг <%s, Макс. NFT: %s, Макс. всего: %s",
         MONITOR_INTERVAL,
         MONITOR_SETTINGS.get("max_rating_level"),
         MONITOR_SETTINGS.get("max_owner_nft_gifts"),
@@ -1398,11 +1434,15 @@ def monitor_status_text() -> str:
     nft_info = f"максимум {max_nft} шт." if max_nft > 0 else "выключен"
     total_info = f"максимум {max_total} шт." if max_total > 0 else "выключен"
 
+    flood_rem = max(0, int(profile_flood_until - time.time()))
+    flood_line = f"\n⚠️ FloodWait профилей TG: <b>ещё {flood_rem // 60} мин.</b>" if flood_rem > 0 else ""
+
     return (
         "📡 <b>АВТОМАТИЧЕСКИЙ МОНИТОРИНГ (ОБЩИЙ ЧАТ)</b>\n\n"
         f"Статус: {'🟢 РАБОТАЕТ' if enabled else '🔴 ОСТАНОВЛЕН'}\n"
+        f"База данных: <b>{'✅ PostgreSQL' if db_pool else '⚠️ Локально'}</b>\n"
         f"Целевая группа: <code>{escape_text(target_text)}</code>\n"
-        f"Интервал круга: <b>{MONITOR_INTERVAL} сек.</b> (глубина: {MONITOR_PAGE_LIMIT} лот)\n"
+        f"Интервал круга: <b>{MONITOR_INTERVAL} сек.</b> (глубина: {MONITOR_PAGE_LIMIT} лота)\n"
         f"Диапазон цены: <b>{escape_text(price_text)}</b>\n"
         f"Фильтр рейтинга: <b>{escape_text(rating_info)}</b>\n"
         f"NFT в профиле: <b>{escape_text(nft_info)}</b>\n"
@@ -1410,7 +1450,8 @@ def monitor_status_text() -> str:
         f"Фильтр юзернеймов: <b>{escape_text(username_text)}</b>\n"
         f"Модели: <b>{escape_text(model_text)}</b>\n"
         f"See.tg: Free <b>{SEETG_BILLING['free_remaining']}</b> | Баланс <b>{SEETG_BILLING['balance_ton']} TON</b>\n"
-        f"Обработано лотов: <b>{len(SENT_GIFTS)}</b>\n\n"
+        f"Обработано лотов: <b>{len(SENT_GIFTS)}</b>"
+        f"{flood_line}\n\n"
         "💡 Для привязки группы напиши команду <code>/set_target_chat</code> прямо в ней."
     )
 
@@ -1430,7 +1471,6 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
 
-    # Если это администратор — открываем панель управления парсером
     if is_admin(user_id):
         if not await is_user_client_authorized():
             await message.answer(
@@ -1448,7 +1488,6 @@ async def cmd_start(message: Message, state: FSMContext):
         )
         return
 
-    # Для обычных пользователей — меню подписки
     u = SUBSCRIPTIONS["users"].get(str(user_id)) or {}
     if u.get("plan") == "lifetime":
         key_str = u.get("key") or "—"
@@ -1469,7 +1508,7 @@ async def cmd_start(message: Message, state: FSMContext):
         text = (
             "👋 <b>ДОБРО ПОЖАЛОВАТЬ В ПРИВАТНЫЙ ПАРСЕР ПОДАРКОВ</b>\n\n"
             "• 🎁 <b>Пробный доступ на 30 минут</b> — бесплатно (1 раз на аккаунт).\n"
-            f"• 💎 <b>Подписка навсегда</b> — <b>{SUBSCRIPTION_PRICE_TON} TON</b> (включает личный ключ с возможностью переноса на другой аккаунт до 3 раз).\n\n"
+            f"• 💎 <b>Подписка навсегда</b> — <b>{SUBSCRIPTION_PRICE_TON} TON</b> (включает личный ключ с возможностью переноса на другой аккаунт до {MAX_KEY_TRANSFERS} раз).\n\n"
             "Выбери подходящий вариант ниже:"
         )
 
@@ -1606,7 +1645,7 @@ async def sub_paid_confirm_callback(callback: CallbackQuery):
 
     await callback.message.edit_text(
         "⏳ <b>Заявка отправлена администраторам!</b>\n\n"
-        "Как только перевод будет подтверждён, бот пришлёт вам сюда одноразовую ссылку в группу и личный ключ.",
+        "Как только перевод будет подтверждён, бот пришлёт вам сюда одноравую ссылку в группу и личный ключ.",
         parse_mode="HTML",
     )
     await callback.answer()
@@ -1751,7 +1790,6 @@ async def sub_activate_key_input(message: Message, state: FSMContext):
             await message.answer("❌ Не удалось создать ссылку в группу. Обратитесь к администратору.")
             return
 
-        # Кикаем старый аккаунт и снимаем с него подписку
         if old_uid and old_uid != new_uid:
             await kick_user_from_group(chat_id, old_uid)
             if str(old_uid) in SUBSCRIPTIONS["users"]:
@@ -1767,7 +1805,6 @@ async def sub_activate_key_input(message: Message, state: FSMContext):
             except Exception:
                 pass
 
-        # Привязываем подписку и ключ к новому аккаунту
         key_data["owner_id"] = new_uid
         key_data["transfers_left"] = transfers_left - 1
 
@@ -1829,7 +1866,6 @@ async def claim_log_callback(callback: CallbackQuery):
         if profile_url:
             dm_text += f'\n🔎 <a href="{escape_text(profile_url)}">Написать продавцу</a>'
 
-        # Сначала пробуем отправить в ЛС (если юзер не запускал бота — попросим нажать /start)
         try:
             await bot.send_message(
                 chat_id=user_id,
@@ -1943,7 +1979,9 @@ async def auth_code(message: Message, state: FSMContext):
             phone_code_hash=data.get("phone_code_hash"),
         )
         await state.clear()
-        await message.answer("✅ Сессия авторизована! Загружаю модели подарков...")
+        session_str = user_client.session.save() if isinstance(user_client.session, StringSession) else ""
+        msg_extra = f"\n\n🔑 Строка для <code>TELETHON_SESSION</code> (сохрани в ENV хостинга):\n<code>{session_str}</code>" if session_str else ""
+        await message.answer(f"✅ Сессия авторизована! Загружаю модели...{msg_extra}", parse_mode="HTML")
         await load_base_gifts()
         await message.answer(f"Готово. Доступно моделей: {len(BASE_GIFTS)}", reply_markup=admin_main_keyboard())
     except SessionPasswordNeededError:
@@ -1962,7 +2000,9 @@ async def auth_password(message: Message, state: FSMContext):
     try:
         await user_client.sign_in(password=(message.text or "").strip())
         await state.clear()
-        await message.answer("✅ 2FA успешно пройдена! Загружаю модели...")
+        session_str = user_client.session.save() if isinstance(user_client.session, StringSession) else ""
+        msg_extra = f"\n\n🔑 Строка для <code>TELETHON_SESSION</code> (сохрани в ENV хостинга):\n<code>{session_str}</code>" if session_str else ""
+        await message.answer(f"✅ 2FA успешно пройдена! Загружаю модели...{msg_extra}", parse_mode="HTML")
         await load_base_gifts()
         await message.answer(f"Готово. Загружено моделей: {len(BASE_GIFTS)}", reply_markup=admin_main_keyboard())
     except Exception as e:
@@ -1970,7 +2010,7 @@ async def auth_password(message: Message, state: FSMContext):
 
 
 # ============================================================
-# АДМИН-МЕНЮ И НАСТРОЙКИ МОНИТОРИНГА (ТОЛЬКО ДЛЯ АДМИНОВ)
+# АДМИН-МЕНЮ И НАСТРОЙКИ МОНИТОРИНГА
 # ============================================================
 
 @dp.callback_query(F.data == "menu")
@@ -2378,6 +2418,7 @@ async def admin_panel(callback: CallbackQuery):
         "⚙️ <b>АДМИН-ПАНЕЛЬ</b>\n\n"
         f"🔐 Сессия: {'✅ АКТИВНА' if is_auth else '❌ НЕ АКТИВНА'}\n"
         f"👤 Аккаунт: {escape_text(account)}\n"
+        f"🗄 База данных: {'✅ PostgreSQL' if db_pool else '⚠️ Локальная'}\n"
         f"👑 Админов: {len([x for x in ADMIN_IDS if x > 0])}\n"
         f"💎 Подписок навсегда: <b>{lifetime_count}</b> | Триал: <b>{trial_count}</b>\n"
         f"📦 Моделей в базе: {len(BASE_GIFTS)}\n"
@@ -2421,24 +2462,32 @@ async def add_session_btn(callback: CallbackQuery, state: FSMContext):
 # ============================================================
 
 async def main():
-    global OWNERS_BLACKLIST, OWNER_CACHE, SEETG_CACHE, SENT_GIFTS, CLAIMED_LOGS, http_session, trial_watcher_task
+    global OWNERS_BLACKLIST, OWNER_CACHE, SEETG_CACHE, SENT_GIFTS, CLAIMED_LOGS, SUBSCRIPTIONS, http_session, trial_watcher_task
 
     validate_config()
+    await init_db()
 
-    OWNERS_BLACKLIST = load_owner_blacklist()
-    OWNER_CACHE = load_owner_cache()
-    SEETG_CACHE = load_seetg_cache()
-    SENT_GIFTS = load_sent_gifts()
-    CLAIMED_LOGS = load_claimed_logs()
-    load_subscriptions()
-    load_monitor_settings()
+    OWNERS_BLACKLIST = await db_get("owner_blacklist", {})
+    OWNER_CACHE = await db_get("owner_cache", {})
+    SEETG_CACHE = await db_get("seetg_cache", {})
+    SENT_GIFTS = await db_get("sent_gifts", {})
+    CLAIMED_LOGS = await db_get("claimed_logs", {})
+
+    saved_subs = await db_get("subscriptions", {})
+    if isinstance(saved_subs, dict):
+        SUBSCRIPTIONS["users"] = saved_subs.get("users") or {}
+        SUBSCRIPTIONS["keys"] = saved_subs.get("keys") or {}
+        SUBSCRIPTIONS["pending_payments"] = saved_subs.get("pending_payments") or {}
+
+    saved_settings = await db_get("monitor_settings", {})
+    apply_loaded_settings(saved_settings)
 
     http_session = aiohttp.ClientSession()
     trial_watcher_task = asyncio.create_task(trial_watcher_loop())
 
     log.info(
-        "Данные загружены: ЧС=%s, кэш профилей=%s, кэш see.tg=%s, отправлено=%s, подписок=%s",
-        len(OWNERS_BLACKLIST), len(OWNER_CACHE), len(SEETG_CACHE), len(SENT_GIFTS), len(SUBSCRIPTIONS["users"])
+        "Данные загружены из БД: ЧС=%s, кэш профилей=%s, кэш see.tg=%s, отправлено=%s, подписок=%s, моделей в настройках=%s",
+        len(OWNERS_BLACKLIST), len(OWNER_CACHE), len(SEETG_CACHE), len(SENT_GIFTS), len(SUBSCRIPTIONS["users"]), len(MONITOR_SETTINGS.get("model_ids") or [])
     )
 
     await ensure_user_client_connected()
@@ -2447,10 +2496,10 @@ async def main():
         me = await user_client.get_me()
         log.info("Сессия Telethon активна: %s (@%s)", me.first_name, me.username)
         await ensure_models_loaded()
-        if MONITOR_SETTINGS.get("enabled") and get_target_chat_id():
+        if MONITOR_SETTINGS.get("enabled") and get_target_chat_id() and MONITOR_SETTINGS.get("model_ids"):
             await start_monitor()
     else:
-        log.warning("Сессия Telethon не авторизована. Напиши боту /add_session")
+        log.warning("Сессия Telethon не авторизована. Напиши боту /add_session или задай TELETHON_SESSION")
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
@@ -2464,6 +2513,12 @@ async def main():
         await stop_monitor()
         if trial_watcher_task and not trial_watcher_task.done():
             trial_watcher_task.cancel()
+        # Дожидаемся записи отложенных задач в PostgreSQL перед выходом
+        pending_saves = [t for t in db_save_tasks.values() if not t.done()]
+        if pending_saves:
+            await asyncio.gather(*pending_saves, return_exceptions=True)
+        if db_pool is not None:
+            await db_pool.close()
         if http_session and not http_session.closed:
             await http_session.close()
         if user_client.is_connected():
