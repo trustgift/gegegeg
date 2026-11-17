@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import secrets
+import socket
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
@@ -11,6 +12,7 @@ from typing import Any, Dict, List, Optional, Set
 import aiohttp
 import asyncpg
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command
 from aiogram.types import (
     Message,
@@ -18,7 +20,11 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+)
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -38,7 +44,7 @@ from telethon.tl.types import PeerUser
 
 
 # ============================================================
-# CONFIG (ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ХОСТИНГА)
+# CONFIG (БЕРЁТСЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ХОСТИНГА)
 # ============================================================
 
 API_ID = int(os.getenv("API_ID", "0"))
@@ -51,7 +57,7 @@ ADMIN_IDS: Set[int] = {
     int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 }
 
-# База данных PostgreSQL (вставь ссылку в переменную DATABASE_URL на bothost.ru)
+# База данных PostgreSQL (переменная DATABASE_URL в ENV)
 RAW_DB_URL = os.getenv("DATABASE_URL", "").strip()
 DATABASE_URL = RAW_DB_URL.replace("Postgresql://", "postgresql://").replace("postgres://", "postgresql://")
 
@@ -89,7 +95,7 @@ REQUEST_PAGE_LIMIT = 20
 
 
 # ============================================================
-# LOGGING / GLOBALS
+# LOGGING & IPv4 NETWORK SESSION
 # ============================================================
 
 logging.basicConfig(
@@ -97,6 +103,15 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("gift-parser")
+
+
+class IPv4AiohttpSession(AiohttpSession):
+    """Принудительный IPv4 для Docker-хостингов (исправляет Connection reset by peer)."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._connector_init["family"] = socket.AF_INET
+        self._connector_init["ttl_dns_cache"] = 300
 
 
 def validate_config():
@@ -118,8 +133,23 @@ def validate_config():
         )
 
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN, session=IPv4AiohttpSession())
 dp = Dispatcher(storage=MemoryStorage())
+
+
+@dp.update.outer_middleware()
+async def network_retry_middleware(handler, event, data):
+    """Автоповтор обработки апдейта при кратковременном сбросе TCP-соединения хостингом."""
+    for attempt in range(3):
+        try:
+            return await handler(event, data)
+        except TelegramNetworkError as e:
+            if attempt == 2:
+                raise
+            log.warning("Сетевой сброс Telegram API (%s), повтор %s/3...", e, attempt + 1)
+            await asyncio.sleep(0.5)
+
+
 user_client = TelegramClient(
     StringSession(TELETHON_SESSION) if TELETHON_SESSION else SESSION_NAME,
     API_ID,
@@ -173,7 +203,7 @@ monitor_first_scan_done = False
 monitor_lock = asyncio.Lock()
 market_api_lock = asyncio.Lock()
 last_market_api_request = 0.0
-profile_flood_until = 0.0  # Временный бан на GetFullUserRequest в Telethon
+profile_flood_until = 0.0
 
 
 # ============================================================
@@ -505,7 +535,6 @@ def username_matches(owner: OwnerInfo) -> bool:
 
 
 def owner_passes_target_filters(owner: OwnerInfo) -> tuple[bool, str]:
-    # Если Telethon временно в FloodWait по профилям, данные профиля не заполнены — пропускаем лот без отсева
     if time.time() < profile_flood_until and owner.total_gifts_count == 0 and owner.nft_gifts_count == 0 and owner.rating_level == 0:
         return True, "flood_bypass"
 
@@ -639,7 +668,8 @@ async def fetch_owner_from_seetg(slug: str) -> Dict[str, Any]:
         return SEETG_CACHE[slug]
 
     if http_session is None or http_session.closed:
-        http_session = aiohttp.ClientSession()
+        connector = aiohttp.TCPConnector(family=socket.AF_INET)
+        http_session = aiohttp.ClientSession(connector=connector)
 
     headers = {
         "Authorization": f"Bearer {SEETG_TOKEN}",
@@ -895,7 +925,6 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
                 rating_stars=cached.get("rating_stars", 0),
             )
 
-        # Если на аккаунте временный FloodWait на просмотр профилей — не спим 6 часов, отдаём данные из see.tg
         if time.time() < profile_flood_until:
             return OwnerInfo(
                 key=f"username:{seetg_username.lower()}" if seetg_username else f"id:{owner_id}",
@@ -1645,7 +1674,7 @@ async def sub_paid_confirm_callback(callback: CallbackQuery):
 
     await callback.message.edit_text(
         "⏳ <b>Заявка отправлена администраторам!</b>\n\n"
-        "Как только перевод будет подтверждён, бот пришлёт вам сюда одноравую ссылку в группу и личный ключ.",
+        "Как только перевод будет подтверждён, бот пришлёт вам сюда одноразовую ссылку в группу и личный ключ.",
         parse_mode="HTML",
     )
     await callback.answer()
@@ -2482,7 +2511,8 @@ async def main():
     saved_settings = await db_get("monitor_settings", {})
     apply_loaded_settings(saved_settings)
 
-    http_session = aiohttp.ClientSession()
+    connector = aiohttp.TCPConnector(family=socket.AF_INET)
+    http_session = aiohttp.ClientSession(connector=connector)
     trial_watcher_task = asyncio.create_task(trial_watcher_loop())
 
     log.info(
@@ -2513,7 +2543,6 @@ async def main():
         await stop_monitor()
         if trial_watcher_task and not trial_watcher_task.done():
             trial_watcher_task.cancel()
-        # Дожидаемся записи отложенных задач в PostgreSQL перед выходом
         pending_saves = [t for t in db_save_tasks.values() if not t.done()]
         if pending_saves:
             await asyncio.gather(*pending_saves, return_exceptions=True)
