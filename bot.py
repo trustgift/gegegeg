@@ -34,6 +34,7 @@ from telethon.sessions import StringSession
 from telethon.errors import (
     FloodWaitError,
     PhoneMigrateError,
+    RpcMcgetFailError,
     SessionPasswordNeededError,
     AuthKeyUnregisteredError,
     PhoneCodeInvalidError,
@@ -260,6 +261,7 @@ class AuthState(StatesGroup):
     waiting_phone = State()
     waiting_code = State()
     waiting_password = State()
+    waiting_string_session = State()
 
 
 class MonitorPriceState(StatesGroup):
@@ -894,7 +896,7 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
 
     if MONITOR_SETTINGS.get("username_mode") == "required" and not seetg_username and owner_id:
         cached = OWNER_CACHE.get(str(owner_id))
-        if cached and not cached.get("username"):
+        if cached and cached.get("username"):
             return None
 
     if owner_id:
@@ -923,7 +925,6 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
                 rating_stars=cached.get("rating_stars", 0),
             )
 
-        # Если на аккаунте временный FloodWait на просмотр профилей — не пропускаем непроверенных юзеров
         if time.time() < profile_flood_until:
             return None
 
@@ -1056,6 +1057,9 @@ async def get_resale_page(
             wait_time = int(e.seconds) + 1
             log.warning("FloodWait на запросе маркета: %s сек.", wait_time)
             await asyncio.sleep(min(wait_time, 60))
+        except RpcMcgetFailError:
+            log.warning("Временный сбой серверов Telegram (RpcMcgetFailError), ждём 5 сек...")
+            await asyncio.sleep(5)
 
 
 def is_stars_only_listing(raw_gift: Any) -> bool:
@@ -1140,7 +1144,6 @@ async def send_monitor_gift(market_gift: MarketGift, base_gift: BaseGift) -> boo
 async def process_monitor_model(base_gift: BaseGift, first_scan: bool) -> int:
     sent_count = 0
 
-    # Если Telegram временно забанил просмотр профилей — не тратим баланс see.tg и не шлём непроверенных юзеров
     if not first_scan and time.time() < profile_flood_until:
         return 0
 
@@ -1492,9 +1495,12 @@ async def cmd_start(message: Message, state: FSMContext):
     if is_admin(user_id):
         if not await is_user_client_authorized():
             await message.answer(
-                "⚠️ Сессия Telethon не подключена.\nНажми /add_session",
+                "⚠️ Сессия Telethon не подключена.\nВыбери способ входа ниже:",
                 reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[[InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")]]
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="🔑 ВСТАВИТЬ STRING SESSION", callback_data="paste_session_btn")],
+                        [InlineKeyboardButton(text="📱 ВОЙТИ ПО НОМЕРУ", callback_data="add_session_btn")],
+                    ]
                 ),
             )
             return
@@ -1924,7 +1930,7 @@ async def claim_log_callback(callback: CallbackQuery):
 
 
 # ============================================================
-# АДМИНСКИЕ КОМАНДЫ И УНИВЕРСАЛЬНАЯ АВТОРИЗАЦИЯ TELETHON (DC 1-5)
+# АДМИНСКИЕ КОМАНДЫ И УНИВЕРСАЛЬНАЯ АВТОРИЗАЦИЯ TELETHON (DC 1-5 + STRING)
 # ============================================================
 
 async def reset_and_prepare_new_session() -> None:
@@ -1947,9 +1953,11 @@ async def finalize_new_session(message: Message) -> None:
     if session_str:
         schedule_db_save("telethon_session", {"session": session_str}, immediate=True)
 
+    me = await user_client.get_me()
     dc_id = getattr(user_client.session, "dc_id", "?")
     await message.answer(
         f"✅ <b>Сессия (DC {dc_id}) успешно подключена и сохранена в PostgreSQL!</b>\n"
+        f"👤 Профиль: <b>{escape_text(me.first_name)}</b> (@{escape_text(me.username or 'без_юзернейма')})\n"
         "Загружаю модели подарков...",
         parse_mode="HTML",
     )
@@ -2056,6 +2064,86 @@ async def auth_password(message: Message, state: FSMContext):
         await finalize_new_session(message)
     except Exception as e:
         await message.answer(f"❌ Неверный пароль: {e}")
+
+
+@dp.message(Command("set_session"))
+@dp.callback_query(F.data == "paste_session_btn")
+async def paste_session_start(event: Message | CallbackQuery, state: FSMContext):
+    if not is_admin(event.from_user.id):
+        return
+
+    await state.clear()
+    await state.set_state(AuthState.waiting_string_session)
+    text = (
+        "🔑 <b>ИМПОРТ ГОТОВОЙ STRING SESSION</b>\n\n"
+        "Отправь сюда строку сессии Telethon (начинается с <code>1...</code>).\n"
+        "Бот сам заменит старую сессию, сохранит новую в PostgreSQL и подключится.\n\n"
+        "❌ Отмена — /cancel"
+    )
+    if isinstance(event, CallbackQuery):
+        await event.message.answer(text, parse_mode="HTML")
+        await event.answer()
+    else:
+        await event.answer(text, parse_mode="HTML")
+
+
+@dp.message(AuthState.waiting_string_session)
+async def paste_session_input(message: Message, state: FSMContext):
+    global user_client, profile_flood_until
+
+    if not is_admin(message.from_user.id):
+        return
+
+    session_str = (message.text or "").strip()
+    if len(session_str) < 50 or " " in session_str:
+        await message.answer(
+            "❌ Некорректная строка <code>StringSession</code> (слишком короткая или содержит пробелы).\n"
+            "Отправь полную строку без лишнего текста или нажми /cancel.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Удаляем сообщение со строкой сессии из чата для безопасности
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await stop_monitor()
+    profile_flood_until = 0.0
+
+    old_client = user_client
+    try:
+        test_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+        await test_client.connect()
+
+        if not await test_client.is_user_authorized():
+            await test_client.disconnect()
+            await message.answer("❌ Эта строка сессии не авторизована или уже сброшена в Telegram. Попробуй другую или /cancel.")
+            return
+
+        if old_client and old_client.is_connected():
+            await old_client.disconnect()
+
+        user_client = test_client
+        schedule_db_save("telethon_session", {"session": session_str}, immediate=True)
+
+        me = await user_client.get_me()
+        dc_id = getattr(user_client.session, "dc_id", "?")
+        await state.clear()
+
+        await message.answer(
+            f"✅ <b>Аккаунт подключён и сохранён в PostgreSQL!</b>\n"
+            f"👤 Профиль: <b>{escape_text(me.first_name)}</b> (@{escape_text(me.username or 'без_юзернейма')})\n"
+            f"🆔 ID: <code>{me.id}</code> | Дата-центр: <b>DC {dc_id}</b>\n\n"
+            "Загружаю модели подарков...",
+            parse_mode="HTML",
+        )
+        await load_base_gifts()
+        await message.answer(f"Готово. Доступно моделей: {len(BASE_GIFTS)}", reply_markup=admin_main_keyboard())
+
+    except Exception as e:
+        await message.answer(f"❌ Ошибка проверки строки сессии: <code>{escape_text(e)}</code>\nПопробуй ещё раз или нажми /cancel", parse_mode="HTML")
 
 
 # ============================================================
@@ -2459,7 +2547,7 @@ async def admin_panel(callback: CallbackQuery):
     is_auth = await is_user_client_authorized()
     me = await user_client.get_me() if is_auth else None
     dc_id = getattr(user_client.session, "dc_id", "?")
-    account = f"{me.first_name} (@{me.username}) [DC {dc_id}]" if me else "—"
+    account = f"{me.first_name} (@{me.username}) [ID: {me.id} | DC {dc_id}]" if me else "—"
 
     lifetime_count = sum(1 for u in SUBSCRIPTIONS["users"].values() if u.get("plan") == "lifetime")
     trial_count = sum(1 for u in SUBSCRIPTIONS["users"].values() if u.get("plan") == "trial")
@@ -2479,7 +2567,8 @@ async def admin_panel(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 СМЕНИТЬ / ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")],
+                [InlineKeyboardButton(text="🔑 ВСТАВИТЬ STRING SESSION", callback_data="paste_session_btn")],
+                [InlineKeyboardButton(text="📱 ВОЙТИ ПО НОМЕРУ (DC 1–5)", callback_data="add_session_btn")],
                 [InlineKeyboardButton(text="🔄 ОБНОВИТЬ МОДЕЛИ", callback_data="reload_models")],
                 [InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")],
             ]
@@ -2522,7 +2611,7 @@ async def main():
     validate_config()
     await init_db()
 
-    # Загружаем сохранённую StringSession из PostgreSQL (приоритет над ENV, если сессию меняли через бота)
+    # Загружаем сохранённую StringSession из PostgreSQL (приоритет над ENV)
     saved_session_obj = await db_get("telethon_session", {})
     db_session_str = saved_session_obj.get("session", "").strip() if isinstance(saved_session_obj, dict) else ""
     active_session_str = db_session_str or TELETHON_SESSION
@@ -2558,12 +2647,12 @@ async def main():
     if await is_user_client_authorized():
         me = await user_client.get_me()
         dc_id = getattr(user_client.session, "dc_id", "?")
-        log.info("Сессия Telethon активна: %s (@%s) [DC %s]", me.first_name, me.username, dc_id)
+        log.info("Сессия Telethon активна: %s (@%s) [ID: %s | DC %s]", me.first_name, me.username, me.id, dc_id)
         await ensure_models_loaded()
         if MONITOR_SETTINGS.get("enabled") and get_target_chat_id() and MONITOR_SETTINGS.get("model_ids"):
             await start_monitor()
     else:
-        log.warning("Сессия Telethon не авторизована. Напиши боту /add_session или нажми кнопку в Админ-панели.")
+        log.warning("Сессия Telethon не авторизована. Используй /set_session или кнопку в Админ-панели.")
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
