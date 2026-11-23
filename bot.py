@@ -425,7 +425,6 @@ async def accounts_watcher_loop() -> None:
             await asyncio.sleep(5)
             now = time.time()
 
-            # 1. Проверяем, кто вышел из FloodWait
             for w in list(ACCOUNTS_POOL):
                 if w.flood_notified and now >= w.flood_until:
                     w.flood_notified = False
@@ -439,7 +438,6 @@ async def accounts_watcher_loop() -> None:
                         f"📊 Активных в пуле: <b>{active_now} из {total}</b>"
                     )
 
-            # 2. Раз в 180 секунд проверяем, не слетела ли какая-либо сессия
             if now - last_health_check >= 180:
                 last_health_check = now
                 for w in list(ACCOUNTS_POOL):
@@ -1061,46 +1059,49 @@ def is_nft_gift(obj: Any) -> bool:
     return False
 
 
-async def fetch_user_nft_gifts_count(user_id: int, max_to_check: int = 10) -> int:
-    worker = await acquire_worker()
-    if worker is None:
-        return 0
-
+async def fetch_user_nft_gifts_count(worker: AccountWorker, peer: Any, user_id: int, max_to_check: int = 10) -> int:
     try:
-        peer = await worker.client.get_input_entity(user_id)
-        raw_gifts = []
+        async with worker.lock:
+            if not worker.client.is_connected():
+                await worker.client.connect()
+            loop_now = asyncio.get_running_loop().time()
+            wait_for = PER_ACCOUNT_DELAY - (loop_now - worker.last_request_ts)
+            if wait_for > 0:
+                await asyncio.sleep(wait_for)
+            worker.last_request_ts = asyncio.get_running_loop().time()
 
-        if hasattr(functions.payments, "GetSavedStarGiftsRequest"):
-            try:
-                res = await worker.client(
-                    functions.payments.GetSavedStarGiftsRequest(
-                        peer=peer,
-                        offset="",
-                        limit=max_to_check + 5,
-                        exclude_unlimited=True,
+            raw_gifts = []
+            if hasattr(functions.payments, "GetSavedStarGiftsRequest"):
+                try:
+                    res = await worker.client(
+                        functions.payments.GetSavedStarGiftsRequest(
+                            peer=peer,
+                            offset="",
+                            limit=max_to_check + 5,
+                            exclude_unlimited=True,
+                        )
                     )
-                )
-                raw_gifts = getattr(res, "gifts", []) or []
-            except TypeError:
+                    raw_gifts = getattr(res, "gifts", []) or []
+                except TypeError:
+                    res = await worker.client(
+                        functions.payments.GetSavedStarGiftsRequest(
+                            peer=peer,
+                            offset="",
+                            limit=30,
+                        )
+                    )
+                    raw_gifts = getattr(res, "gifts", []) or []
+            elif hasattr(functions.payments, "GetUserStarGiftsRequest"):
                 res = await worker.client(
-                    functions.payments.GetSavedStarGiftsRequest(
-                        peer=peer,
+                    functions.payments.GetUserStarGiftsRequest(
+                        user_id=peer,
                         offset="",
                         limit=30,
                     )
                 )
                 raw_gifts = getattr(res, "gifts", []) or []
-        elif hasattr(functions.payments, "GetUserStarGiftsRequest"):
-            res = await worker.client(
-                functions.payments.GetUserStarGiftsRequest(
-                    user_id=peer,
-                    offset="",
-                    limit=30,
-                )
-            )
-            raw_gifts = getattr(res, "gifts", []) or []
 
-        return sum(1 for g in raw_gifts if is_nft_gift(g))
+            return sum(1 for g in raw_gifts if is_nft_gift(g))
 
     except FloodWaitError as e:
         set_worker_flood(worker, e.seconds, "GetSavedStarGifts")
@@ -1130,9 +1131,10 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
     if not owner_id and not seetg_username:
         return None
 
-    if MONITOR_SETTINGS.get("username_mode") == "required" and not seetg_username and owner_id:
-        cached = OWNER_CACHE.get(str(owner_id))
-        if cached and not cached.get("username"):
+    # Если нужны только юзеры с @username, а see.tg вернул пустой username — не тратим запрос Telethon
+    if MONITOR_SETTINGS.get("username_mode") == "required" and not seetg_username:
+        cached = OWNER_CACHE.get(str(owner_id)) if owner_id else None
+        if not cached or not cached.get("username"):
             return None
 
     if owner_id:
@@ -1162,13 +1164,10 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
             return None
 
         try:
-            try:
+            if seetg_username:
+                peer = await worker.client.get_input_entity(seetg_username)
+            else:
                 peer = await worker.client.get_input_entity(owner_id)
-            except Exception:
-                if seetg_username:
-                    peer = await worker.client.get_input_entity(seetg_username)
-                else:
-                    raise
 
             full = await worker.client(GetFullUserRequest(id=peer))
             full_user = full.full_user
@@ -1215,7 +1214,7 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
             elif max_nft > 0 and total_gifts <= max_nft:
                 nft_gifts_count = total_gifts
             else:
-                nft_gifts_count = await fetch_user_nft_gifts_count(owner_id, max_to_check=max_nft + 1)
+                nft_gifts_count = await fetch_user_nft_gifts_count(worker, peer, owner_id, max_to_check=max_nft + 1)
 
             OWNER_CACHE[cache_key] = {
                 "v": 3,
@@ -2937,7 +2936,6 @@ async def main():
     validate_config()
     await init_db()
 
-    # Загружаем пул аккаунтов из PostgreSQL (и подхватываем одиночную сессию при миграции)
     saved_accounts = await db_get("telethon_accounts", [])
     if isinstance(saved_accounts, list):
         for item in saved_accounts:
