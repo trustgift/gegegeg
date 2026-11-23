@@ -6,7 +6,7 @@ import os
 import secrets
 import socket
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
 import aiohttp
@@ -21,7 +21,6 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 from aiogram.exceptions import (
-    TelegramBadRequest,
     TelegramForbiddenError,
     TelegramNetworkError,
 )
@@ -37,6 +36,8 @@ from telethon.errors import (
     RpcMcgetFailError,
     SessionPasswordNeededError,
     AuthKeyUnregisteredError,
+    UserDeactivatedBanError,
+    UserDeactivatedError,
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
 )
@@ -46,7 +47,7 @@ from telethon.tl.types import PeerUser
 
 
 # ============================================================
-# CONFIG (БЕРЁТСЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ХОСТИНГА)
+# CONFIG (ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ХОСТИНГА)
 # ============================================================
 
 API_ID = int(os.getenv("API_ID", "0"))
@@ -54,12 +55,10 @@ API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELETHON_SESSION = os.getenv("TELETHON_SESSION", "").strip()
 
-# Админы через запятую в ENV: ADMIN_IDS=1602809044,123456789
 ADMIN_IDS: Set[int] = {
     int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 }
 
-# База данных PostgreSQL (переменная DATABASE_URL в ENV)
 RAW_DB_URL = os.getenv("DATABASE_URL", "").strip()
 DATABASE_URL = RAW_DB_URL.replace("Postgresql://", "postgresql://").replace("postgres://", "postgresql://")
 
@@ -71,25 +70,33 @@ MAX_KEY_TRANSFERS = 3             # Максимум переносов подп
 # Настройки API see.tg (kartoshka.free)
 SEETG_TOKEN = os.getenv("SEETG_TOKEN", "").strip()
 SEETG_BASE_URL = "https://kartoshka.free/v1"
-SEETG_REQUEST_DELAY = 0.8
+SEETG_REQUEST_DELAY = 0.6
 
-SESSION_NAME = "telethon_market_userbot"
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 
-# Скорость работы (сбалансированный быстрый режим без частых FloodWait)
-MONITOR_INTERVAL = 15       # Пауза между кругами обхода (сек)
+# СБАЛАНСИРОВАННОЕ УСКОРЕНИЕ (~2x БЫСТРЕЕ ИСХОДНОГО, БЕЗ ПЕРЕГРУЗА)
+MONITOR_INTERVAL = 8        # Пауза между кругами обхода (сек)
 MONITOR_PAGE_LIMIT = 2      # Проверять 2 самых свежих лота с модели за круг
-MONITOR_API_DELAY = 2.2     # Безопасная задержка запросов профилей в Telethon (сек)
-MONITOR_SEND_DELAY = 0.35   # Пауза между отправкой сообщений в чат (сек)
-MODEL_STEP_DELAY = 0.8      # Пауза при переходе к следующей модели (сек)
+PER_ACCOUNT_DELAY = 1.5     # Персональная задержка на каждый аккаунт в пуле (сек)
+MONITOR_SEND_DELAY = 0.3    # Пауза между отправкой сообщений в чат (сек)
+MODEL_STEP_DELAY = 0.45     # Пауза при переходе к следующей модели (сек)
 
-# Фильтры по умолчанию (обычные юзеры с 1-3 подарками)
-DEFAULT_MAX_NFT_GIFTS = 3        # Максимум NFT-подарков в профиле
-DEFAULT_MAX_TOTAL_GIFTS = 6      # Максимум ВСЕХ подарков в профиле (NFT + обычные)
-DEFAULT_MAX_RATING = 5           # Порог рейтинга (строго < 5, включая -1 и 0)
+# ФИЛЬТРЫ ПО УМОЛЧАНИЮ ("НЕ ШАРЯЩИЕ")
+DEFAULT_MAX_NFT_GIFTS = 3        # Максимум 3 NFT-подарка в профиле
+DEFAULT_MAX_TOTAL_GIFTS = 60     # Максимум 60 подарков всего (обычные + NFT)
+DEFAULT_MAX_RATING = 5           # Рейтинг строго < 5
 DEFAULT_MIN_PRICE = 0
 DEFAULT_MAX_PRICE = 0
 DEFAULT_USERNAME_MODE = "required"
+DEFAULT_STRICT_NEWBIE = True     # Отсеивать тех, у кого свой канал или слова скупа/NFT в био
+DEFAULT_NO_PREMIUM = True        # Отсеивать пользователей с Telegram Premium
+
+TRADER_STOP_WORDS = (
+    "nft", "нфт", "gift", "гифт", "подарк", "скуп", "продам", "куплю",
+    "otc", "отс", "гарант", "garant", "ton", "тон", "usdt", "crypto", "крипт",
+    "канал", "t.me/", "http", "shop", "store", "market", "маркет",
+    "trade", "трейд", "p2p", "обмен", "admin", "manager", "менеджер",
+)
 
 SEND_EXISTING_ON_FIRST_SCAN = False
 GIFTS_PER_PAGE = 8
@@ -141,7 +148,6 @@ dp = Dispatcher(storage=MemoryStorage())
 
 @dp.update.outer_middleware()
 async def network_retry_middleware(handler, event, data):
-    """Автоповтор обработки апдейта при кратковременном сбросе TCP-соединения хостингом."""
     for attempt in range(3):
         try:
             return await handler(event, data)
@@ -149,14 +155,9 @@ async def network_retry_middleware(handler, event, data):
             if attempt == 2:
                 raise
             log.warning("Сетевой сброс Telegram API (%s), повтор %s/3...", e, attempt + 1)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.4)
 
 
-user_client = TelegramClient(
-    StringSession(TELETHON_SESSION) if TELETHON_SESSION else SESSION_NAME,
-    API_ID,
-    API_HASH,
-)
 http_session: Optional[aiohttp.ClientSession] = None
 db_pool: Optional[asyncpg.Pool] = None
 
@@ -196,20 +197,270 @@ MONITOR_SETTINGS: Dict[str, Any] = {
     "max_owner_nft_gifts": DEFAULT_MAX_NFT_GIFTS,
     "max_owner_total_gifts": DEFAULT_MAX_TOTAL_GIFTS,
     "max_rating_level": DEFAULT_MAX_RATING,
+    "strict_newbie_mode": DEFAULT_STRICT_NEWBIE,
+    "no_premium_only": DEFAULT_NO_PREMIUM,
 }
 
 monitor_task: Optional[asyncio.Task] = None
 trial_watcher_task: Optional[asyncio.Task] = None
+accounts_watcher_task: Optional[asyncio.Task] = None
 monitor_running = False
 monitor_first_scan_done = False
 monitor_lock = asyncio.Lock()
-market_api_lock = asyncio.Lock()
-last_market_api_request = 0.0
-profile_flood_until = 0.0
 
 
 # ============================================================
-# DATA CLASSES
+# УВЕДОМЛЕНИЯ АДМИНАМ В ЛС
+# ============================================================
+
+async def notify_admins(text: str) -> None:
+    for admin_id in ADMIN_IDS:
+        if admin_id > 0:
+            try:
+                await bot.send_message(admin_id, text, parse_mode="HTML", disable_web_page_preview=True)
+            except Exception as e:
+                log.warning("Не удалось отправить уведомление админу %s: %s", admin_id, e)
+
+
+# ============================================================
+# MULTI-ACCOUNT POOL (АВТО-ОТКЛЮЧЕНИЕ И ВОЗВРАТ ПОСЛЕ FLOODWAIT)
+# ============================================================
+
+@dataclass
+class AccountWorker:
+    acc_id: str
+    session_str: str
+    client: TelegramClient
+    label: str = "Аккаунт"
+    user_id: int = 0
+    dc_id: int = 0
+    flood_until: float = 0.0
+    flood_notified: bool = False
+    last_request_ts: float = 0.0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+ACCOUNTS_POOL: List[AccountWorker] = []
+pool_rr_index = 0
+pool_select_lock = asyncio.Lock()
+pending_auth_client: Optional[TelegramClient] = None
+
+
+def save_accounts_pool() -> None:
+    payload = [
+        {
+            "acc_id": w.acc_id,
+            "session": w.session_str,
+            "label": w.label,
+            "user_id": w.user_id,
+            "dc_id": w.dc_id,
+        }
+        for w in ACCOUNTS_POOL
+    ]
+    schedule_db_save("telethon_accounts", payload, immediate=True)
+
+
+def set_worker_flood(worker: AccountWorker, seconds: int, context_name: str = "API") -> None:
+    wait_time = max(5, int(seconds) + 2)
+    already_in_flood = time.time() < worker.flood_until
+    worker.flood_until = max(worker.flood_until, time.time() + wait_time)
+
+    if not already_in_flood or not worker.flood_notified:
+        worker.flood_notified = True
+        mins = max(1, round(wait_time / 60))
+        active_left = get_active_accounts_count()
+        total = len(ACCOUNTS_POOL)
+        log.warning(
+            "⏳ Аккаунт %s поймал FloodWait (%s сек / ~%s мин) на %s. Активных осталось: %s/%s",
+            worker.label, wait_time, mins, context_name, active_left, total
+        )
+        asyncio.create_task(
+            notify_admins(
+                f"⏳ <b>Аккаунт ушёл в FloodWait</b>\n\n"
+                f"👤 Профиль: <b>{escape_text(worker.label)}</b> [DC {worker.dc_id}]\n"
+                f"⏱ Пауза: <b>{wait_time} сек. (~{mins} мин.)</b>\n"
+                f"📊 Активных в пуле осталось: <b>{active_left} из {total}</b>\n\n"
+                "<i>Аккаунт временно отключён. Как только флуд закончится, он автоматически вернётся в работу.</i>"
+            )
+        )
+
+
+async def handle_dead_session(worker: AccountWorker, reason: str) -> None:
+    if worker not in ACCOUNTS_POOL:
+        return
+    ACCOUNTS_POOL.remove(worker)
+    save_accounts_pool()
+    try:
+        if worker.client.is_connected():
+            await worker.client.disconnect()
+    except Exception:
+        pass
+
+    active_left = get_active_accounts_count()
+    total = len(ACCOUNTS_POOL)
+    log.error("❌ Сессия %s слетела (%s) и удалена из пула!", worker.label, reason)
+    await notify_admins(
+        f"🚨 <b>СЛЕТЕЛА СЕССИЯ АККАУНТА!</b>\n\n"
+        f"👤 Профиль: <b>{escape_text(worker.label)}</b> [ID: <code>{worker.user_id}</code>]\n"
+        f"❌ Причина: <code>{escape_text(reason)}</code>\n"
+        f"📊 Осталось в пуле: <b>{active_left} активных / {total} всего</b>\n\n"
+        "Добавь замену через /set_session или в меню 👥 АККАУНТЫ."
+    )
+
+
+async def add_account_to_pool(session_str: str, save: bool = True) -> Optional[AccountWorker]:
+    session_str = session_str.strip()
+    if not session_str:
+        return None
+
+    for existing in ACCOUNTS_POOL:
+        if existing.session_str == session_str:
+            return existing
+
+    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    await client.connect()
+    try:
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            return None
+        me = await client.get_me()
+    except Exception:
+        await client.disconnect()
+        return None
+
+    for idx, existing in enumerate(list(ACCOUNTS_POOL)):
+        if existing.user_id == me.id:
+            try:
+                await existing.client.disconnect()
+            except Exception:
+                pass
+            ACCOUNTS_POOL.pop(idx)
+
+    dc_id = getattr(client.session, "dc_id", 0) or 0
+    uname = f"@{me.username}" if me.username else f"id:{me.id}"
+    label = f"{me.first_name or 'User'} ({uname})"
+    acc_id = secrets.token_hex(4)
+
+    worker = AccountWorker(
+        acc_id=acc_id,
+        session_str=session_str,
+        client=client,
+        label=label,
+        user_id=me.id,
+        dc_id=dc_id,
+    )
+    ACCOUNTS_POOL.append(worker)
+    if save:
+        save_accounts_pool()
+    log.info("✅ Аккаунт добавлен в пул: %s [ID: %s | DC %s] (Всего в пуле: %s)", label, me.id, dc_id, len(ACCOUNTS_POOL))
+    return worker
+
+
+async def remove_account_from_pool(acc_id: str) -> bool:
+    for idx, w in enumerate(ACCOUNTS_POOL):
+        if w.acc_id == acc_id:
+            try:
+                await w.client.disconnect()
+            except Exception:
+                pass
+            ACCOUNTS_POOL.pop(idx)
+            save_accounts_pool()
+            return True
+    return False
+
+
+def get_active_accounts_count() -> int:
+    now = time.time()
+    return sum(1 for w in ACCOUNTS_POOL if now >= w.flood_until)
+
+
+def get_min_flood_wait_remaining() -> int:
+    if not ACCOUNTS_POOL:
+        return 0
+    now = time.time()
+    if any(now >= w.flood_until for w in ACCOUNTS_POOL):
+        return 0
+    return max(1, int(min(w.flood_until - now for w in ACCOUNTS_POOL)))
+
+
+async def acquire_worker() -> Optional[AccountWorker]:
+    """Берёт следующий активный аккаунт по кругу; аккаунты во FloodWait пропускаются до окончания таймера."""
+    global pool_rr_index
+    if not ACCOUNTS_POOL:
+        return None
+
+    async with pool_select_lock:
+        now = time.time()
+        n = len(ACCOUNTS_POOL)
+        chosen: Optional[AccountWorker] = None
+
+        for offset in range(n):
+            idx = (pool_rr_index + offset) % n
+            candidate = ACCOUNTS_POOL[idx]
+            if now >= candidate.flood_until:
+                chosen = candidate
+                pool_rr_index = (idx + 1) % n
+                break
+
+        if chosen is None:
+            return None
+
+    async with chosen.lock:
+        if not chosen.client.is_connected():
+            await chosen.client.connect()
+        loop_now = asyncio.get_running_loop().time()
+        wait_for = PER_ACCOUNT_DELAY - (loop_now - chosen.last_request_ts)
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        chosen.last_request_ts = asyncio.get_running_loop().time()
+
+    return chosen
+
+
+async def accounts_watcher_loop() -> None:
+    """Следит за окончанием FloodWait (автоматически возвращает в работу) и проверяет живучесть сессий."""
+    last_health_check = 0.0
+    while True:
+        try:
+            await asyncio.sleep(5)
+            now = time.time()
+
+            # 1. Проверяем, кто вышел из FloodWait
+            for w in list(ACCOUNTS_POOL):
+                if w.flood_notified and now >= w.flood_until:
+                    w.flood_notified = False
+                    w.flood_until = 0.0
+                    active_now = get_active_accounts_count()
+                    total = len(ACCOUNTS_POOL)
+                    log.info("🟢 FloodWait закончился для %s! Аккаунт вернулся в работу (%s/%s).", w.label, active_now, total)
+                    await notify_admins(
+                        f"🟢 <b>FloodWait закончился — аккаунт снова в работе!</b>\n\n"
+                        f"👤 Профиль: <b>{escape_text(w.label)}</b> [DC {w.dc_id}]\n"
+                        f"📊 Активных в пуле: <b>{active_now} из {total}</b>"
+                    )
+
+            # 2. Раз в 180 секунд проверяем, не слетела ли какая-либо сессия
+            if now - last_health_check >= 180:
+                last_health_check = now
+                for w in list(ACCOUNTS_POOL):
+                    try:
+                        if not w.client.is_connected():
+                            await w.client.connect()
+                        if not await w.client.is_user_authorized():
+                            await handle_dead_session(w, "Сессия разлогинена (is_user_authorized = False)")
+                    except (AuthKeyUnregisteredError, UserDeactivatedBanError, UserDeactivatedError) as e:
+                        await handle_dead_session(w, e.__class__.__name__)
+                    except Exception as e:
+                        log.warning("Ошибка проверки здоровья сессии %s: %s", w.label, e)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error("Ошибка в accounts_watcher_loop: %s", e)
+
+
+# ============================================================
+# DATA CLASSES & FSM STATES
 # ============================================================
 
 @dataclass
@@ -232,6 +483,9 @@ class OwnerInfo:
     total_gifts_count: int = 0
     rating_level: int = 0
     rating_stars: int = 0
+    is_premium: bool = False
+    has_channel: bool = False
+    bio_has_trader_words: bool = False
 
     @property
     def display(self) -> str:
@@ -252,10 +506,6 @@ class MarketGift:
     def link(self) -> str:
         return f"https://t.me/nft/{self.slug}"
 
-
-# ============================================================
-# FSM STATES
-# ============================================================
 
 class AuthState(StatesGroup):
     waiting_phone = State()
@@ -348,7 +598,7 @@ async def db_get(key: str, default: Any) -> Any:
 
 async def _db_set_worker(key: str, data_json: str, immediate: bool = False) -> None:
     if not immediate:
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(1.0)
     if db_pool is None:
         return
     try:
@@ -384,22 +634,22 @@ def save_owner_blacklist() -> None:
 
 
 def save_owner_cache() -> None:
-    if len(OWNER_CACHE) > 10000:
-        for k in list(OWNER_CACHE.keys())[:-8000]:
+    if len(OWNER_CACHE) > 12000:
+        for k in list(OWNER_CACHE.keys())[:-10000]:
             OWNER_CACHE.pop(k, None)
     schedule_db_save("owner_cache", OWNER_CACHE)
 
 
 def save_seetg_cache() -> None:
-    if len(SEETG_CACHE) > 15000:
-        for k in list(SEETG_CACHE.keys())[:-12000]:
+    if len(SEETG_CACHE) > 18000:
+        for k in list(SEETG_CACHE.keys())[:-15000]:
             SEETG_CACHE.pop(k, None)
     schedule_db_save("seetg_cache", SEETG_CACHE)
 
 
 def save_sent_gifts() -> None:
-    if len(SENT_GIFTS) > 4000:
-        for k in list(SENT_GIFTS.keys())[:-3000]:
+    if len(SENT_GIFTS) > 5000:
+        for k in list(SENT_GIFTS.keys())[:-4000]:
             SENT_GIFTS.pop(k, None)
     schedule_db_save("sent_gifts", SENT_GIFTS)
 
@@ -409,8 +659,8 @@ def save_subscriptions() -> None:
 
 
 def save_claimed_logs() -> None:
-    if len(CLAIMED_LOGS) > 2000:
-        for k in list(CLAIMED_LOGS.keys())[:-1500]:
+    if len(CLAIMED_LOGS) > 2500:
+        for k in list(CLAIMED_LOGS.keys())[:-2000]:
             CLAIMED_LOGS.pop(k, None)
     schedule_db_save("claimed_logs", CLAIMED_LOGS, immediate=True)
 
@@ -431,6 +681,8 @@ def apply_loaded_settings(data: Any) -> None:
     MONITOR_SETTINGS["max_owner_nft_gifts"] = max(0, int(data.get("max_owner_nft_gifts", DEFAULT_MAX_NFT_GIFTS) or 0))
     MONITOR_SETTINGS["max_owner_total_gifts"] = max(0, int(data.get("max_owner_total_gifts", DEFAULT_MAX_TOTAL_GIFTS) or 0))
     MONITOR_SETTINGS["max_rating_level"] = max(0, int(data.get("max_rating_level", DEFAULT_MAX_RATING) or 0))
+    MONITOR_SETTINGS["strict_newbie_mode"] = bool(data.get("strict_newbie_mode", DEFAULT_STRICT_NEWBIE))
+    MONITOR_SETTINGS["no_premium_only"] = bool(data.get("no_premium_only", DEFAULT_NO_PREMIUM))
 
     username_mode = str(data.get("username_mode", DEFAULT_USERNAME_MODE)).lower()
     MONITOR_SETTINGS["username_mode"] = username_mode if username_mode in {"any", "required"} else "required"
@@ -503,6 +755,11 @@ def extract_stars_amount(value: Any) -> int:
     return 0
 
 
+def has_trader_keywords(name: str, bio: str) -> bool:
+    combined = f"{name} {bio}".lower()
+    return any(word in combined for word in TRADER_STOP_WORDS)
+
+
 def owner_blacklist_keys(owner: OwnerInfo) -> Set[str]:
     keys: Set[str] = set()
     if owner.user_id:
@@ -541,6 +798,17 @@ def owner_passes_target_filters(owner: OwnerInfo) -> tuple[bool, str]:
     max_nft = safe_int(MONITOR_SETTINGS.get("max_owner_nft_gifts"), 0)
     max_total = safe_int(MONITOR_SETTINGS.get("max_owner_total_gifts"), 0)
     max_rating = safe_int(MONITOR_SETTINGS.get("max_rating_level"), 0)
+    strict_newbie = bool(MONITOR_SETTINGS.get("strict_newbie_mode", True))
+    no_premium = bool(MONITOR_SETTINGS.get("no_premium_only", True))
+
+    if no_premium and owner.is_premium:
+        return False, "есть Telegram Premium"
+
+    if strict_newbie:
+        if owner.has_channel:
+            return False, "привязан свой канал в профиле"
+        if owner.bio_has_trader_words:
+            return False, "стоп-слова трейдера/скупа в профиле"
 
     if max_rating > 0 and owner.rating_level >= max_rating:
         return False, f"рейтинг {owner.rating_level} >= {max_rating}"
@@ -680,7 +948,7 @@ async def fetch_owner_from_seetg(slug: str) -> Dict[str, Any]:
     for _ in range(3):
         await pace_seetg_api()
         try:
-            async with http_session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with http_session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
                 free_rem = resp.headers.get("X-Free-Remaining")
                 bal_ton = resp.headers.get("X-Balance")
                 if free_rem is not None:
@@ -696,8 +964,7 @@ async def fetch_owner_from_seetg(slug: str) -> Dict[str, Any]:
                     return {"status": "no_balance"}
 
                 if resp.status == 429:
-                    retry_after = float(resp.headers.get("Retry-After", 2.0))
-                    log.warning("SEE.TG: Лимит запросов (429), ждём %.1f сек.", retry_after)
+                    retry_after = float(resp.headers.get("Retry-After", 1.5))
                     await asyncio.sleep(retry_after)
                     continue
 
@@ -708,7 +975,6 @@ async def fetch_owner_from_seetg(slug: str) -> Dict[str, Any]:
                     return res_data
 
                 if resp.status != 200:
-                    log.warning("SEE.TG: HTTP %s для %s", resp.status, slug)
                     return {"status": "http_error"}
 
                 data = await resp.json()
@@ -768,41 +1034,13 @@ async def fetch_owner_from_seetg(slug: str) -> Dict[str, Any]:
 
         except Exception as e:
             log.warning("SEE.TG: Ошибка запроса для %s: %s", slug, e)
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)
 
     return {"status": "error"}
 
 
 # ============================================================
-# TELETHON CLIENT & RATE LIMITER
-# ============================================================
-
-async def ensure_user_client_connected() -> None:
-    if not user_client.is_connected():
-        await user_client.connect()
-
-
-async def is_user_client_authorized() -> bool:
-    await ensure_user_client_connected()
-    try:
-        return await user_client.is_user_authorized()
-    except (AuthKeyUnregisteredError, ValueError, ConnectionError) as e:
-        log.warning("Сессия сброшена или не зарегистрирована: %s", e)
-        return False
-
-
-async def pace_market_api() -> None:
-    global last_market_api_request
-    async with market_api_lock:
-        now = asyncio.get_running_loop().time()
-        wait_for = MONITOR_API_DELAY - (now - last_market_api_request)
-        if wait_for > 0:
-            await asyncio.sleep(wait_for)
-        last_market_api_request = asyncio.get_running_loop().time()
-
-
-# ============================================================
-# ТОЧНЫЙ ПОДСЧЁТ ТОЛЬКО NFT-ПОДАРКОВ И ПРОФИЛЯ
+# ТОЧНЫЙ ПОДСЧЁТ ТОЛЬКО NFT-ПОДАРКОВ И ПРОВЕРКА НОВИЧКА
 # ============================================================
 
 def is_nft_gift(obj: Any) -> bool:
@@ -824,18 +1062,17 @@ def is_nft_gift(obj: Any) -> bool:
 
 
 async def fetch_user_nft_gifts_count(user_id: int, max_to_check: int = 10) -> int:
-    global profile_flood_until
-    if time.time() < profile_flood_until:
+    worker = await acquire_worker()
+    if worker is None:
         return 0
 
     try:
-        await pace_market_api()
-        peer = await user_client.get_input_entity(user_id)
+        peer = await worker.client.get_input_entity(user_id)
         raw_gifts = []
 
         if hasattr(functions.payments, "GetSavedStarGiftsRequest"):
             try:
-                res = await user_client(
+                res = await worker.client(
                     functions.payments.GetSavedStarGiftsRequest(
                         peer=peer,
                         offset="",
@@ -845,7 +1082,7 @@ async def fetch_user_nft_gifts_count(user_id: int, max_to_check: int = 10) -> in
                 )
                 raw_gifts = getattr(res, "gifts", []) or []
             except TypeError:
-                res = await user_client(
+                res = await worker.client(
                     functions.payments.GetSavedStarGiftsRequest(
                         peer=peer,
                         offset="",
@@ -854,7 +1091,7 @@ async def fetch_user_nft_gifts_count(user_id: int, max_to_check: int = 10) -> in
                 )
                 raw_gifts = getattr(res, "gifts", []) or []
         elif hasattr(functions.payments, "GetUserStarGiftsRequest"):
-            res = await user_client(
+            res = await worker.client(
                 functions.payments.GetUserStarGiftsRequest(
                     user_id=peer,
                     offset="",
@@ -866,9 +1103,10 @@ async def fetch_user_nft_gifts_count(user_id: int, max_to_check: int = 10) -> in
         return sum(1 for g in raw_gifts if is_nft_gift(g))
 
     except FloodWaitError as e:
-        wait_time = int(e.seconds) + 1
-        profile_flood_until = time.time() + wait_time
-        log.warning("FloodWait на проверку NFT (%s сек). Ставим парсинг профилей на паузу.", wait_time)
+        set_worker_flood(worker, e.seconds, "GetSavedStarGifts")
+        return 0
+    except (AuthKeyUnregisteredError, UserDeactivatedBanError, UserDeactivatedError) as e:
+        await handle_dead_session(worker, e.__class__.__name__)
         return 0
     except Exception as e:
         log.warning("Ошибка подсчёта NFT для %s: %s", user_id, e)
@@ -876,8 +1114,6 @@ async def fetch_user_nft_gifts_count(user_id: int, max_to_check: int = 10) -> in
 
 
 async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
-    global profile_flood_until
-
     slug = str(get_field(raw_gift, "slug") or "")
     owner_id = extract_owner_id(get_field(raw_gift, "owner_id"))
     seetg_username: Optional[str] = None
@@ -896,21 +1132,14 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
 
     if MONITOR_SETTINGS.get("username_mode") == "required" and not seetg_username and owner_id:
         cached = OWNER_CACHE.get(str(owner_id))
-        if cached and cached.get("username"):
+        if cached and not cached.get("username"):
             return None
 
     if owner_id:
         cache_key = str(owner_id)
         cached = OWNER_CACHE.get(cache_key)
 
-        cache_is_corrupted = (
-            cached
-            and cached.get("v") != 2
-            and cached.get("nft_gifts_count", 0) == 0
-            and cached.get("total_gifts_count", 0) > 0
-        )
-
-        if cached and "nft_gifts_count" in cached and "rating_level" in cached and not cache_is_corrupted:
+        if cached and cached.get("v") == 3:
             username = cached.get("username") or seetg_username or None
             label = cached.get("label") or seetg_name or f"id:{owner_id}"
             key = f"username:{username.lower()}" if username else f"id:{owner_id}"
@@ -923,24 +1152,25 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
                 total_gifts_count=cached.get("total_gifts_count", 0),
                 rating_level=cached.get("rating_level", 0),
                 rating_stars=cached.get("rating_stars", 0),
+                is_premium=bool(cached.get("is_premium", False)),
+                has_channel=bool(cached.get("has_channel", False)),
+                bio_has_trader_words=bool(cached.get("bio_has_trader_words", False)),
             )
 
-        if time.time() < profile_flood_until:
+        worker = await acquire_worker()
+        if worker is None:
             return None
 
         try:
-            await ensure_user_client_connected()
-            await pace_market_api()
-
             try:
-                peer = await user_client.get_input_entity(owner_id)
+                peer = await worker.client.get_input_entity(owner_id)
             except Exception:
                 if seetg_username:
-                    peer = await user_client.get_input_entity(seetg_username)
+                    peer = await worker.client.get_input_entity(seetg_username)
                 else:
                     raise
 
-            full = await user_client(GetFullUserRequest(id=peer))
+            full = await worker.client(GetFullUserRequest(id=peer))
             full_user = full.full_user
 
             user_obj = next((u for u in full.users if u.id == owner_id), None) or (full.users[0] if full.users else None)
@@ -948,6 +1178,11 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
             first_name = getattr(user_obj, "first_name", "") or ""
             last_name = getattr(user_obj, "last_name", "") or ""
             name = f"{first_name} {last_name}".strip() or seetg_name or ""
+            about = getattr(full_user, "about", "") or ""
+
+            is_premium = bool(getattr(user_obj, "premium", False))
+            has_channel = bool(getattr(full_user, "personal_channel_id", None))
+            bio_trader = has_trader_keywords(name, about)
 
             label = f"@{username}" if username else (name or f"id:{owner_id}")
             key = f"username:{username.lower()}" if username else f"id:{owner_id}"
@@ -966,16 +1201,24 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
 
             max_rating = safe_int(MONITOR_SETTINGS.get("max_rating_level"), 0)
             max_total = safe_int(MONITOR_SETTINGS.get("max_owner_total_gifts"), 0)
-            early_reject = (max_rating > 0 and rating_level >= max_rating) or (max_total > 0 and total_gifts > max_total)
+            max_nft = safe_int(MONITOR_SETTINGS.get("max_owner_nft_gifts"), DEFAULT_MAX_NFT_GIFTS)
+
+            early_reject = (
+                (max_rating > 0 and rating_level >= max_rating)
+                or (max_total > 0 and total_gifts > max_total)
+                or (MONITOR_SETTINGS.get("strict_newbie_mode") and (has_channel or bio_trader))
+                or (MONITOR_SETTINGS.get("no_premium_only") and is_premium)
+            )
 
             if early_reject:
                 nft_gifts_count = 0
+            elif max_nft > 0 and total_gifts <= max_nft:
+                nft_gifts_count = total_gifts
             else:
-                max_limit = safe_int(MONITOR_SETTINGS.get("max_owner_nft_gifts"), DEFAULT_MAX_NFT_GIFTS)
-                nft_gifts_count = await fetch_user_nft_gifts_count(owner_id, max_to_check=max_limit + 1)
+                nft_gifts_count = await fetch_user_nft_gifts_count(owner_id, max_to_check=max_nft + 1)
 
             OWNER_CACHE[cache_key] = {
-                "v": 2,
+                "v": 3,
                 "label": label,
                 "username": username or "",
                 "user_id": owner_id,
@@ -983,12 +1226,15 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
                 "total_gifts_count": total_gifts,
                 "rating_level": rating_level,
                 "rating_stars": rating_stars,
+                "is_premium": is_premium,
+                "has_channel": has_channel,
+                "bio_has_trader_words": bio_trader,
             }
             save_owner_cache()
 
             log.info(
-                "Профиль %s: всего подарков=%s, NFT=%s, рейтинг=%s",
-                label, total_gifts, "пропуск" if early_reject else nft_gifts_count, rating_level
+                "[%s] Профиль %s: подарков=%s, NFT=%s, рейтинг=%s, канал=%s, bio_скуп=%s",
+                worker.label, label, total_gifts, nft_gifts_count, rating_level, has_channel, bio_trader
             )
 
             return OwnerInfo(
@@ -1000,16 +1246,19 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
                 total_gifts_count=total_gifts,
                 rating_level=rating_level,
                 rating_stars=rating_stars,
+                is_premium=is_premium,
+                has_channel=has_channel,
+                bio_has_trader_words=bio_trader,
             )
 
         except FloodWaitError as e:
-            wait_time = int(e.seconds) + 1
-            profile_flood_until = time.time() + wait_time
-            log.warning("FloodWait при запросе профиля %s (%s сек). Ставим парсинг новых лотов на паузу до разбана.", owner_id, wait_time)
+            set_worker_flood(worker, e.seconds, "GetFullUser")
             return None
-
+        except (AuthKeyUnregisteredError, UserDeactivatedBanError, UserDeactivatedError) as e:
+            await handle_dead_session(worker, e.__class__.__name__)
+            return None
         except Exception as e:
-            log.warning("Telethon не открыл профиль %s (%s)", owner_id, e)
+            log.warning("Не удалось открыть профиль %s (%s)", owner_id, e)
             return None
 
     return None
@@ -1025,11 +1274,13 @@ async def get_resale_page(
     limit: int = REQUEST_PAGE_LIMIT,
     sort_by_price: bool = False,
 ):
-    while True:
+    for _ in range(3):
+        worker = await acquire_worker()
+        if worker is None:
+            return None
         try:
-            await pace_market_api()
             try:
-                return await user_client(
+                return await worker.client(
                     functions.payments.GetResaleStarGiftsRequest(
                         gift_id=gift_id,
                         offset=offset,
@@ -1042,7 +1293,7 @@ async def get_resale_page(
                 )
             except TypeError as e:
                 if "stars_only" in str(e) or "for_craft" in str(e):
-                    return await user_client(
+                    return await worker.client(
                         functions.payments.GetResaleStarGiftsRequest(
                             gift_id=gift_id,
                             offset=offset,
@@ -1054,12 +1305,13 @@ async def get_resale_page(
                 raise
 
         except FloodWaitError as e:
-            wait_time = int(e.seconds) + 1
-            log.warning("FloodWait на запросе маркета: %s сек.", wait_time)
-            await asyncio.sleep(min(wait_time, 60))
+            set_worker_flood(worker, e.seconds, "GetResaleStarGifts")
+        except (AuthKeyUnregisteredError, UserDeactivatedBanError, UserDeactivatedError) as e:
+            await handle_dead_session(worker, e.__class__.__name__)
         except RpcMcgetFailError:
-            log.warning("Временный сбой серверов Telegram (RpcMcgetFailError), ждём 5 сек...")
-            await asyncio.sleep(5)
+            log.warning("Временный сбой серверов Telegram (RpcMcgetFailError), ждём 3 сек...")
+            await asyncio.sleep(3)
+    return None
 
 
 def is_stars_only_listing(raw_gift: Any) -> bool:
@@ -1088,8 +1340,9 @@ async def send_monitor_gift(market_gift: MarketGift, base_gift: BaseGift) -> boo
 
     owner = market_gift.owner
     num_line = f" #{market_gift.num}" if market_gift.num else ""
-    rating_display = str(owner.rating_level) if owner.rating_level > 0 else "0 / новый"
+    rating_display = str(owner.rating_level) if owner.rating_level > 0 else "0 / новичок"
     profile_line = f"{owner.nft_gifts_count} NFT (всего: {owner.total_gifts_count} шт.)"
+    prem_tag = "без Premium" if not owner.is_premium else "с Premium"
 
     public_text = (
         "🚨 <b>НОВЫЙ ЛОГ (STARS)</b>\n\n"
@@ -1097,7 +1350,7 @@ async def send_monitor_gift(market_gift: MarketGift, base_gift: BaseGift) -> boo
         f"📦 <b>Модель:</b> {escape_text(base_gift.title)}\n"
         f"💰 <b>Цена:</b> {market_gift.price} ⭐\n"
         f"👑 <b>Рейтинг владельца:</b> {rating_display}\n"
-        f"🖼 <b>Профиль:</b> {profile_line}\n\n"
+        f"🖼 <b>Профиль:</b> {profile_line} • {prem_tag}\n\n"
         "👇 Нажми кнопку ниже, чтобы забрать контакт себе в ЛС:"
     )
 
@@ -1144,7 +1397,7 @@ async def send_monitor_gift(market_gift: MarketGift, base_gift: BaseGift) -> boo
 async def process_monitor_model(base_gift: BaseGift, first_scan: bool) -> int:
     sent_count = 0
 
-    if not first_scan and time.time() < profile_flood_until:
+    if get_active_accounts_count() == 0:
         return 0
 
     try:
@@ -1154,6 +1407,9 @@ async def process_monitor_model(base_gift: BaseGift, first_scan: bool) -> int:
             limit=MONITOR_PAGE_LIMIT,
             sort_by_price=False,
         )
+        if result is None:
+            return 0
+
         raw_gifts = getattr(result, "gifts", []) or []
 
         for raw in raw_gifts:
@@ -1176,7 +1432,7 @@ async def process_monitor_model(base_gift: BaseGift, first_scan: bool) -> int:
 
             owner = await resolve_owner_info(raw)
             if not owner:
-                if time.time() >= profile_flood_until:
+                if get_active_accounts_count() > 0:
                     SENT_GIFTS[slug] = {"skipped": "hidden_or_unavailable", "gift_id": base_gift.gift_id}
                 continue
 
@@ -1212,10 +1468,6 @@ async def process_monitor_model(base_gift: BaseGift, first_scan: bool) -> int:
             else:
                 SENT_GIFTS.pop(slug, None)
 
-    except FloodWaitError as e:
-        wait_time = int(e.seconds) + 1
-        log.warning("FloodWait в мониторе для %s: %s сек.", base_gift.title, wait_time)
-        await asyncio.sleep(min(wait_time, 60))
     except Exception as e:
         log.exception("Ошибка проверки модели %s: %s", base_gift.title, e)
 
@@ -1232,7 +1484,7 @@ async def monitor_cycle(first_scan: bool = False) -> int:
         for index, model in enumerate(models, 1):
             if not MONITOR_SETTINGS.get("enabled"):
                 break
-            if not first_scan and time.time() < profile_flood_until:
+            if get_active_accounts_count() == 0:
                 break
             try:
                 sent = await process_monitor_model(model, first_scan)
@@ -1258,7 +1510,8 @@ async def monitor_loop() -> None:
     monitor_first_scan_done = False
 
     log.info(
-        "Монитор запущен (интервал: %s сек). Рейтинг <%s, Макс. NFT: %s, Макс. всего: %s",
+        "Монитор запущен (акков в пуле: %s, интервал: %s сек). Рейтинг <%s, Макс. NFT: %s, Макс. всего: %s",
+        len(ACCOUNTS_POOL),
         MONITOR_INTERVAL,
         MONITOR_SETTINGS.get("max_rating_level"),
         MONITOR_SETTINGS.get("max_owner_nft_gifts"),
@@ -1273,6 +1526,10 @@ async def monitor_loop() -> None:
                 MONITOR_SETTINGS["enabled"] = False
                 save_monitor_settings()
                 break
+
+            if get_active_accounts_count() == 0:
+                await asyncio.sleep(5)
+                continue
 
             await monitor_cycle(first_scan=first_scan)
             monitor_first_scan_done = True
@@ -1289,7 +1546,7 @@ async def monitor_loop() -> None:
 
 async def start_monitor() -> bool:
     global monitor_task
-    if not get_target_chat_id() or not await is_user_client_authorized():
+    if not get_target_chat_id() or not ACCOUNTS_POOL:
         return False
 
     MONITOR_SETTINGS["enabled"] = True
@@ -1323,12 +1580,12 @@ async def stop_monitor() -> None:
 async def load_base_gifts() -> List[BaseGift]:
     global BASE_GIFTS, BASE_GIFTS_BY_ID
     log.info("Загрузка моделей подарков с маркета...")
-    try:
-        await ensure_user_client_connected()
-        if not await user_client.is_user_authorized():
-            return []
+    worker = await acquire_worker()
+    if worker is None:
+        return []
 
-        result = await user_client(functions.payments.GetStarGiftsRequest(hash=0))
+    try:
+        result = await worker.client(functions.payments.GetStarGiftsRequest(hash=0))
         raw_gifts = getattr(result, "gifts", []) or []
 
         gifts: List[BaseGift] = []
@@ -1374,8 +1631,9 @@ async def ensure_models_loaded() -> None:
 def admin_main_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="📡 МОНИТОРИНГ", callback_data="monitor_menu")],
+        [InlineKeyboardButton(text=f"👥 АККАУНТЫ (ПУЛ: {len(ACCOUNTS_POOL)})", callback_data="accounts_menu")],
         [InlineKeyboardButton(text="🚫 ЧЁРНЫЙ СПИСОК", callback_data="blacklist")],
-        [InlineKeyboardButton(text="⚙️ АДМИН-ПАНЕЛЬ", callback_data="admin_panel")],
+        [InlineKeyboardButton(text="⚙️ СТАТИСТИКА / АДМИНКА", callback_data="admin_panel")],
         [InlineKeyboardButton(text="🔄 ОБНОВИТЬ МОДЕЛИ", callback_data="reload_models")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1397,8 +1655,10 @@ def user_subscription_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 def monitor_keyboard() -> InlineKeyboardMarkup:
     enabled = bool(MONITOR_SETTINGS.get("enabled"))
-    rows = []
+    strict_on = bool(MONITOR_SETTINGS.get("strict_newbie_mode", True))
+    no_prem = bool(MONITOR_SETTINGS.get("no_premium_only", True))
 
+    rows = []
     if enabled:
         rows.append([InlineKeyboardButton(text="⏸ ОСТАНОВИТЬ", callback_data="monitor_stop")])
     else:
@@ -1412,6 +1672,16 @@ def monitor_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="🖼 NFT ЛИМИТ", callback_data="monitor_nft_limit"),
             InlineKeyboardButton(text="📦 ВСЕГО ПОДАРКОВ", callback_data="monitor_total_gifts"),
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"🎯 НЕ ШАРЯЩИЕ: {'ВКЛ' if strict_on else 'ВЫКЛ'}",
+                callback_data="monitor_toggle_newbie",
+            ),
+            InlineKeyboardButton(
+                text=f"⭐️ БЕЗ PREMIUM: {'ВКЛ' if no_prem else 'ВЫКЛ'}",
+                callback_data="monitor_toggle_premium",
+            ),
         ],
         [
             InlineKeyboardButton(text="👤 USERNAME", callback_data="monitor_username"),
@@ -1431,6 +1701,8 @@ def monitor_status_text() -> str:
     max_rating = safe_int(MONITOR_SETTINGS.get("max_rating_level"), 0)
     max_nft = safe_int(MONITOR_SETTINGS.get("max_owner_nft_gifts"), 0)
     max_total = safe_int(MONITOR_SETTINGS.get("max_owner_total_gifts"), 0)
+    strict_on = bool(MONITOR_SETTINGS.get("strict_newbie_mode", True))
+    no_prem = bool(MONITOR_SETTINGS.get("no_premium_only", True))
 
     if min_price and max_price:
         price_text = f"{min_price}—{max_price} ⭐"
@@ -1447,28 +1719,33 @@ def monitor_status_text() -> str:
     target_text = str(target) if target else "❌ не задана"
 
     rating_info = f"строго < {max_rating} уровня" if max_rating > 0 else "выключен"
-    nft_info = f"максимум {max_nft} шт." if max_nft > 0 else "выключен"
-    total_info = f"максимум {max_total} шт." if max_total > 0 else "выключен"
+    nft_info = f"макс. {max_nft} шт." if max_nft > 0 else "выкл"
+    total_info = f"макс. {max_total} шт." if max_total > 0 else "выкл"
 
-    flood_rem = max(0, int(profile_flood_until - time.time()))
+    active_accs = get_active_accounts_count()
+    total_accs = len(ACCOUNTS_POOL)
+    eff_delay = round(PER_ACCOUNT_DELAY / max(1, active_accs), 2) if active_accs else PER_ACCOUNT_DELAY
+
+    flood_rem = get_min_flood_wait_remaining()
     flood_line = (
-        f"\n⏸ <b>ПАУЗА (FloodWait профилей TG): ещё {flood_rem // 60} мин.</b>\n"
-        "<i>(Смените аккаунт в Админ-панели, чтобы продолжить без ожидания)</i>"
-        if flood_rem > 0
+        f"\n⏸ <b>ПАУЗА (все аккаунты в FloodWait): ещё {flood_rem // 60} мин.</b>\n"
+        "<i>(Как только таймер закончится, аккаунты сами вернутся в работу)</i>"
+        if total_accs > 0 and active_accs == 0
         else ""
     )
 
     return (
-        "📡 <b>АВТОМАТИЧЕСКИЙ МОНИТОРИНГ (ОБЩИЙ ЧАТ)</b>\n\n"
+        "📡 <b>АВТОМАТИЧЕСКИЙ МОНИТОРИНГ (2X + ПУЛ АККОВ)</b>\n\n"
         f"Статус: {'🟢 РАБОТАЕТ' if enabled else '🔴 ОСТАНОВЛЕН'}\n"
-        f"База данных: <b>{'✅ PostgreSQL' if db_pool else '⚠️ Локально'}</b>\n"
-        f"Целевая группа: <code>{escape_text(target_text)}</code>\n"
+        f"Аккаунтов в работе: <b>{active_accs} из {total_accs}</b> (~{eff_delay} сек/запрос)\n"
         f"Интервал круга: <b>{MONITOR_INTERVAL} сек.</b> (глубина: {MONITOR_PAGE_LIMIT} лота)\n"
+        f"Целевая группа: <code>{escape_text(target_text)}</code>\n"
         f"Диапазон цены: <b>{escape_text(price_text)}</b>\n"
         f"Фильтр рейтинга: <b>{escape_text(rating_info)}</b>\n"
-        f"NFT в профиле: <b>{escape_text(nft_info)}</b>\n"
-        f"Всего подарков в профиле: <b>{escape_text(total_info)}</b>\n"
-        f"Фильтр юзернеймов: <b>{escape_text(username_text)}</b>\n"
+        f"NFT / Всего подарков: <b>{escape_text(nft_info)} / {escape_text(total_info)}</b>\n"
+        f"Режим «Не шарящие»: <b>{'✅ ВКЛ (без каналов и био скупов)' if strict_on else '❌ ВЫКЛ'}</b>\n"
+        f"Фильтр Premium: <b>{'✅ только без Premium' if no_prem else 'любые'}</b>\n"
+        f"Юзернейм: <b>{escape_text(username_text)}</b>\n"
         f"Модели: <b>{escape_text(model_text)}</b>\n"
         f"See.tg: Free <b>{SEETG_BILLING['free_remaining']}</b> | Баланс <b>{SEETG_BILLING['balance_ton']} TON</b>\n"
         f"Обработано лотов: <b>{len(SENT_GIFTS)}</b>"
@@ -1493,9 +1770,9 @@ async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
     if is_admin(user_id):
-        if not await is_user_client_authorized():
+        if not ACCOUNTS_POOL:
             await message.answer(
-                "⚠️ Сессия Telethon не подключена.\nВыбери способ входа ниже:",
+                "⚠️ В пуле нет ни одного аккаунта Telethon.\nДобавь первый аккаунт ниже:",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[
                         [InlineKeyboardButton(text="🔑 ВСТАВИТЬ STRING SESSION", callback_data="paste_session_btn")],
@@ -1506,7 +1783,7 @@ async def cmd_start(message: Message, state: FSMContext):
             return
         await ensure_models_loaded()
         await message.answer(
-            "👑 <b>ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n\nПарсер доступен только администраторам. Выбери раздел:",
+            "👑 <b>ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n\nВыбери нужный раздел:",
             parse_mode="HTML",
             reply_markup=admin_main_keyboard(),
         )
@@ -1930,39 +2207,75 @@ async def claim_log_callback(callback: CallbackQuery):
 
 
 # ============================================================
-# АДМИНСКИЕ КОМАНДЫ И УНИВЕРСАЛЬНАЯ АВТОРИЗАЦИЯ TELETHON (DC 1-5 + STRING)
+# УПРАВЛЕНИЕ ПУЛОМ АККАУНТОВ (ДОБАВЛЕНИЕ / УДАЛЕНИЕ)
 # ============================================================
 
-async def reset_and_prepare_new_session() -> None:
-    """Останавливает монитор, разрывает старую сессию и создаёт чистый клиент под любой DC."""
-    global user_client, profile_flood_until
-    await stop_monitor()
-    profile_flood_until = 0.0
-    try:
-        if user_client.is_connected():
-            await user_client.disconnect()
-    except Exception:
-        pass
-    user_client = TelegramClient(StringSession(), API_ID, API_HASH)
-    await user_client.connect()
+def accounts_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    now = time.time()
+    for w in ACCOUNTS_POOL:
+        if now < w.flood_until:
+            rem_min = max(1, int((w.flood_until - now) // 60))
+            status_icon = f"⏳ {rem_min}м"
+        else:
+            status_icon = "🟢"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{status_icon} {w.label} [DC {w.dc_id}] — Удалить"[:64],
+                callback_data=f"del_acc:{w.acc_id}",
+            )
+        ])
+
+    rows.append([InlineKeyboardButton(text="🔑 ДОБАВИТЬ ЧЕРЕЗ STRING SESSION", callback_data="paste_session_btn")])
+    rows.append([InlineKeyboardButton(text="📱 ДОБАВИТЬ ПО НОМЕРУ (DC 1–5)", callback_data="add_session_btn")])
+    rows.append([InlineKeyboardButton(text="🏠 ГЛАВНОЕ МЕНЮ", callback_data="menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def finalize_new_session(message: Message) -> None:
-    """Сохраняет новую StringSession в PostgreSQL и выводит её админу."""
-    session_str = user_client.session.save() if isinstance(user_client.session, StringSession) else ""
-    if session_str:
-        schedule_db_save("telethon_session", {"session": session_str}, immediate=True)
+def accounts_menu_text() -> str:
+    active = get_active_accounts_count()
+    total = len(ACCOUNTS_POOL)
+    eff_speed = round(PER_ACCOUNT_DELAY / max(1, active), 2) if active else PER_ACCOUNT_DELAY
 
-    me = await user_client.get_me()
-    dc_id = getattr(user_client.session, "dc_id", "?")
-    await message.answer(
-        f"✅ <b>Сессия (DC {dc_id}) успешно подключена и сохранена в PostgreSQL!</b>\n"
-        f"👤 Профиль: <b>{escape_text(me.first_name)}</b> (@{escape_text(me.username or 'без_юзернейма')})\n"
-        "Загружаю модели подарков...",
+    lines = [
+        "👥 <b>УПРАВЛЕНИЕ ПУЛОМ АККАУНТОВ TELETHON</b>\n",
+        f"Активных аккаунтов: <b>{active} из {total}</b>",
+        f"Эффективная скорость: <b>1 запрос каждые ~{eff_speed} сек.</b>\n",
+    ]
+    if not ACCOUNTS_POOL:
+        lines.append("⚠️ Пул пуст. Добавь хотя бы 1 аккаунт ниже.")
+    else:
+        lines.append("Нажми на аккаунт в списке ниже, чтобы удалить его из пула:")
+
+    return "\n".join(lines)
+
+
+@dp.callback_query(F.data == "accounts_menu")
+async def accounts_menu_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.message.edit_text(
+        accounts_menu_text(),
         parse_mode="HTML",
+        reply_markup=accounts_menu_keyboard(),
     )
-    await load_base_gifts()
-    await message.answer(f"Готово. Доступно моделей: {len(BASE_GIFTS)}", reply_markup=admin_main_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("del_acc:"))
+async def del_acc_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    acc_id = callback.data.split(":", 1)[1]
+    removed = await remove_account_from_pool(acc_id)
+    if not ACCOUNTS_POOL:
+        await stop_monitor()
+    await callback.answer("🗑 Аккаунт удалён из пула." if removed else "Аккаунт не найден.")
+    await callback.message.edit_text(
+        accounts_menu_text(),
+        parse_mode="HTML",
+        reply_markup=accounts_menu_keyboard(),
+    )
 
 
 @dp.message(Command("set_target_chat"))
@@ -1975,21 +2288,27 @@ async def set_target_chat(message: Message):
 
 
 @dp.message(Command("add_session"))
-async def add_session_command(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+@dp.callback_query(F.data == "add_session_btn")
+async def add_session_start(event: Message | CallbackQuery, state: FSMContext):
+    if not is_admin(event.from_user.id):
         return
     await state.clear()
     await state.set_state(AuthState.waiting_phone)
-    await message.answer(
-        "📱 <b>Подключение / смена аккаунта (поддерживаются все DC 1–5)</b>\n\n"
+    text = (
+        "📱 <b>ДОБАВЛЕНИЕ АККАУНТА В ПУЛ ПО НОМЕРУ (DC 1–5)</b>\n\n"
         "Введи номер телефона (например: <code>+79991234567</code>):\n"
-        "❌ Отмена — /cancel",
-        parse_mode="HTML",
+        "❌ Отмена — /cancel"
     )
+    if isinstance(event, CallbackQuery):
+        await event.message.answer(text, parse_mode="HTML")
+        await event.answer()
+    else:
+        await event.answer(text, parse_mode="HTML")
 
 
 @dp.message(AuthState.waiting_phone)
 async def auth_phone(message: Message, state: FSMContext):
+    global pending_auth_client
     if not is_admin(message.from_user.id):
         return
     raw_phone = (message.text or "").strip()
@@ -2000,20 +2319,24 @@ async def auth_phone(message: Message, state: FSMContext):
 
     phone = "+" + digits
     try:
-        await reset_and_prepare_new_session()
+        if pending_auth_client and pending_auth_client.is_connected():
+            await pending_auth_client.disconnect()
+
+        pending_auth_client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await pending_auth_client.connect()
+
         try:
-            sent_code = await user_client.send_code_request(phone)
+            sent_code = await pending_auth_client.send_code_request(phone)
         except PhoneMigrateError as e:
-            log.info("Аккаунт %s находится на DC %s, переключаем дата-центр...", phone, e.new_dc)
-            await user_client._switch_dc(e.new_dc)
-            sent_code = await user_client.send_code_request(phone)
+            await pending_auth_client._switch_dc(e.new_dc)
+            sent_code = await pending_auth_client.send_code_request(phone)
 
         await state.update_data(phone=phone, phone_code_hash=sent_code.phone_code_hash)
         await state.set_state(AuthState.waiting_code)
-        dc_id = getattr(user_client.session, "dc_id", "?")
+        dc_id = getattr(pending_auth_client.session, "dc_id", "?")
         await message.answer(
             f"✅ Код отправлен (<b>DC {dc_id}</b>).\n"
-            "⚠️ Вводи код <b>с пробелом</b> (например: <code>12 345</code>), чтобы Telegram не заблокировал его:",
+            "⚠️ Вводи код <b>с пробелом</b> (например: <code>12 345</code>):",
             parse_mode="HTML",
         )
     except Exception as e:
@@ -2023,7 +2346,8 @@ async def auth_phone(message: Message, state: FSMContext):
 
 @dp.message(AuthState.waiting_code)
 async def auth_code(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    global pending_auth_client
+    if not is_admin(message.from_user.id) or pending_auth_client is None:
         return
 
     raw_text = (message.text or "").strip()
@@ -2038,13 +2362,24 @@ async def auth_code(message: Message, state: FSMContext):
 
     data = await state.get_data()
     try:
-        await user_client.sign_in(
+        await pending_auth_client.sign_in(
             phone=data.get("phone"),
             code=code,
             phone_code_hash=data.get("phone_code_hash"),
         )
+        session_str = pending_auth_client.session.save()
+        await pending_auth_client.disconnect()
+        pending_auth_client = None
         await state.clear()
-        await finalize_new_session(message)
+
+        worker = await add_account_to_pool(session_str, save=True)
+        await ensure_models_loaded()
+        await message.answer(
+            f"✅ <b>Аккаунт добавлен в пул!</b>\n👤 {escape_text(worker.label)} [DC {worker.dc_id}]\n"
+            f"Всего в пуле: <b>{len(ACCOUNTS_POOL)}</b>",
+            parse_mode="HTML",
+            reply_markup=accounts_menu_keyboard(),
+        )
     except SessionPasswordNeededError:
         await state.set_state(AuthState.waiting_password)
         await message.answer("🔐 На аккаунте включён 2FA. Введи облачный пароль:")
@@ -2056,12 +2391,24 @@ async def auth_code(message: Message, state: FSMContext):
 
 @dp.message(AuthState.waiting_password)
 async def auth_password(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    global pending_auth_client
+    if not is_admin(message.from_user.id) or pending_auth_client is None:
         return
     try:
-        await user_client.sign_in(password=(message.text or "").strip())
+        await pending_auth_client.sign_in(password=(message.text or "").strip())
+        session_str = pending_auth_client.session.save()
+        await pending_auth_client.disconnect()
+        pending_auth_client = None
         await state.clear()
-        await finalize_new_session(message)
+
+        worker = await add_account_to_pool(session_str, save=True)
+        await ensure_models_loaded()
+        await message.answer(
+            f"✅ <b>Аккаунт добавлен в пул!</b>\n👤 {escape_text(worker.label)} [DC {worker.dc_id}]\n"
+            f"Всего в пуле: <b>{len(ACCOUNTS_POOL)}</b>",
+            parse_mode="HTML",
+            reply_markup=accounts_menu_keyboard(),
+        )
     except Exception as e:
         await message.answer(f"❌ Неверный пароль: {e}")
 
@@ -2075,9 +2422,9 @@ async def paste_session_start(event: Message | CallbackQuery, state: FSMContext)
     await state.clear()
     await state.set_state(AuthState.waiting_string_session)
     text = (
-        "🔑 <b>ИМПОРТ ГОТОВОЙ STRING SESSION</b>\n\n"
+        "🔑 <b>ДОБАВЛЕНИЕ STRING SESSION В ПУЛ</b>\n\n"
         "Отправь сюда строку сессии Telethon (начинается с <code>1...</code>).\n"
-        "Бот сам заменит старую сессию, сохранит новую в PostgreSQL и подключится.\n\n"
+        "Бот проверит её, добавит в пул активных аккаунтов и сохранит в PostgreSQL.\n\n"
         "❌ Отмена — /cancel"
     )
     if isinstance(event, CallbackQuery):
@@ -2089,8 +2436,6 @@ async def paste_session_start(event: Message | CallbackQuery, state: FSMContext)
 
 @dp.message(AuthState.waiting_string_session)
 async def paste_session_input(message: Message, state: FSMContext):
-    global user_client, profile_flood_until
-
     if not is_admin(message.from_user.id):
         return
 
@@ -2103,47 +2448,29 @@ async def paste_session_input(message: Message, state: FSMContext):
         )
         return
 
-    # Удаляем сообщение со строкой сессии из чата для безопасности
     try:
         await message.delete()
     except Exception:
         pass
 
-    await stop_monitor()
-    profile_flood_until = 0.0
-
-    old_client = user_client
     try:
-        test_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-        await test_client.connect()
-
-        if not await test_client.is_user_authorized():
-            await test_client.disconnect()
+        worker = await add_account_to_pool(session_str, save=True)
+        if not worker:
             await message.answer("❌ Эта строка сессии не авторизована или уже сброшена в Telegram. Попробуй другую или /cancel.")
             return
 
-        if old_client and old_client.is_connected():
-            await old_client.disconnect()
-
-        user_client = test_client
-        schedule_db_save("telethon_session", {"session": session_str}, immediate=True)
-
-        me = await user_client.get_me()
-        dc_id = getattr(user_client.session, "dc_id", "?")
         await state.clear()
-
+        await ensure_models_loaded()
         await message.answer(
-            f"✅ <b>Аккаунт подключён и сохранён в PostgreSQL!</b>\n"
-            f"👤 Профиль: <b>{escape_text(me.first_name)}</b> (@{escape_text(me.username or 'без_юзернейма')})\n"
-            f"🆔 ID: <code>{me.id}</code> | Дата-центр: <b>DC {dc_id}</b>\n\n"
-            "Загружаю модели подарков...",
+            f"✅ <b>Аккаунт добавлен в пул и сохранён в PostgreSQL!</b>\n"
+            f"👤 Профиль: <b>{escape_text(worker.label)}</b>\n"
+            f"🆔 ID: <code>{worker.user_id}</code> | Дата-центр: <b>DC {worker.dc_id}</b>\n"
+            f"📊 Всего аккаунтов в пуле: <b>{len(ACCOUNTS_POOL)}</b>",
             parse_mode="HTML",
+            reply_markup=accounts_menu_keyboard(),
         )
-        await load_base_gifts()
-        await message.answer(f"Готово. Доступно моделей: {len(BASE_GIFTS)}", reply_markup=admin_main_keyboard())
-
     except Exception as e:
-        await message.answer(f"❌ Ошибка проверки строки сессии: <code>{escape_text(e)}</code>\nПопробуй ещё раз или нажми /cancel", parse_mode="HTML")
+        await message.answer(f"❌ Ошибка проверки строки сессии: <code>{escape_text(e)}</code>\nПопробуй ещё раз или /cancel", parse_mode="HTML")
 
 
 # ============================================================
@@ -2184,8 +2511,8 @@ async def monitor_start_callback(callback: CallbackQuery):
     if not get_target_chat_id():
         await callback.answer("Сначала привяжи группу через /set_target_chat", show_alert=True)
         return
-    if not await is_user_client_authorized():
-        await callback.answer("Сессия не авторизована.", show_alert=True)
+    if not ACCOUNTS_POOL:
+        await callback.answer("Добавь хотя бы 1 аккаунт в меню 👥 АККАУНТЫ", show_alert=True)
         return
     if not MONITOR_SETTINGS.get("model_ids"):
         await callback.answer("Выбери хотя бы 1 модель в меню 🎁 МОДЕЛИ", show_alert=True)
@@ -2203,6 +2530,26 @@ async def monitor_stop_callback(callback: CallbackQuery):
     await stop_monitor()
     await callback.message.edit_text(monitor_status_text(), parse_mode="HTML", reply_markup=monitor_keyboard())
     await callback.answer("⏸ Мониторинг остановлен.")
+
+
+@dp.callback_query(F.data == "monitor_toggle_newbie")
+async def monitor_toggle_newbie_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    MONITOR_SETTINGS["strict_newbie_mode"] = not bool(MONITOR_SETTINGS.get("strict_newbie_mode", True))
+    save_monitor_settings()
+    await callback.message.edit_text(monitor_status_text(), parse_mode="HTML", reply_markup=monitor_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "monitor_toggle_premium")
+async def monitor_toggle_premium_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    MONITOR_SETTINGS["no_premium_only"] = not bool(MONITOR_SETTINGS.get("no_premium_only", True))
+    save_monitor_settings()
+    await callback.message.edit_text(monitor_status_text(), parse_mode="HTML", reply_markup=monitor_keyboard())
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "monitor_username")
@@ -2259,7 +2606,7 @@ async def monitor_rating_callback(callback: CallbackQuery, state: FSMContext):
     await state.set_state(MonitorRatingState.waiting_rating)
     await callback.message.answer(
         "👑 <b>Настройка фильтра рейтинга Telegram</b>\n\n"
-        "• <code>5</code> — только обычные юзеры с рейтингом <b>строго меньше 5</b>.\n"
+        "• <code>5</code> — только юзеры с рейтингом <b>строго меньше 5</b>.\n"
         "• <code>0</code> — отключить проверку рейтинга.\n\n"
         "❌ Отмена — /cancel",
         parse_mode="HTML"
@@ -2321,7 +2668,7 @@ async def monitor_total_gifts_callback(callback: CallbackQuery, state: FSMContex
     await state.set_state(MonitorTotalGiftsState.waiting_total_limit)
     await callback.message.answer(
         "📦 <b>Максимум ВСЕХ подарков в профиле</b>\n\n"
-        "• <code>6</code> — пропускать только юзеров, у которых всего не больше 6 подарков.\n"
+        "• <code>60</code> — пропускать юзеров, у которых всего больше 60 подарков.\n"
         "• <code>0</code> — выключить фильтр.\n\n"
         "❌ Отмена — /cancel",
         parse_mode="HTML"
@@ -2335,7 +2682,7 @@ async def monitor_total_gifts_input(message: Message, state: FSMContext):
         return
     text = (message.text or "").strip()
     if not text.isdigit():
-        await message.answer("❌ Отправь число (например: <code>6</code> или <code>0</code>).", parse_mode="HTML")
+        await message.answer("❌ Отправь число (например: <code>60</code> или <code>0</code>).", parse_mode="HTML")
         return
 
     val = int(text)
@@ -2544,31 +2891,25 @@ async def clear_blacklist(callback: CallbackQuery):
 async def admin_panel(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-    is_auth = await is_user_client_authorized()
-    me = await user_client.get_me() if is_auth else None
-    dc_id = getattr(user_client.session, "dc_id", "?")
-    account = f"{me.first_name} (@{me.username}) [ID: {me.id} | DC {dc_id}]" if me else "—"
 
     lifetime_count = sum(1 for u in SUBSCRIPTIONS["users"].values() if u.get("plan") == "lifetime")
     trial_count = sum(1 for u in SUBSCRIPTIONS["users"].values() if u.get("plan") == "trial")
 
     await callback.message.edit_text(
-        "⚙️ <b>АДМИН-ПАНЕЛЬ</b>\n\n"
-        f"🔐 Сессия: {'✅ АКТИВНА' if is_auth else '❌ НЕ АКТИВНА'}\n"
-        f"👤 Аккаунт: {escape_text(account)}\n"
+        "⚙️ <b>СТАТИСТИКА И АДМИН-ПАНЕЛЬ</b>\n\n"
+        f"👥 Аккаунтов в пуле: <b>{get_active_accounts_count()} активных / {len(ACCOUNTS_POOL)} всего</b>\n"
         f"🗄 База данных: {'✅ PostgreSQL' if db_pool else '⚠️ Локальная'}\n"
         f"👑 Админов: {len([x for x in ADMIN_IDS if x > 0])}\n"
         f"💎 Подписок навсегда: <b>{lifetime_count}</b> | Триал: <b>{trial_count}</b>\n"
         f"📦 Моделей в базе: {len(BASE_GIFTS)}\n"
         f"💰 See.tg Free: <b>{SEETG_BILLING['free_remaining']}</b> | Баланс: <b>{SEETG_BILLING['balance_ton']} TON</b>\n"
-        f"💾 Кэш see.tg: {len(SEETG_CACHE)} шт.\n"
+        f"💾 Кэш see.tg: {len(SEETG_CACHE)} шт. | Профилей: {len(OWNER_CACHE)} шт.\n"
         f"🚫 В blacklist: {len(OWNERS_BLACKLIST)}\n"
         f"📤 Обработано лотов: {len(SENT_GIFTS)}",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="🔑 ВСТАВИТЬ STRING SESSION", callback_data="paste_session_btn")],
-                [InlineKeyboardButton(text="📱 ВОЙТИ ПО НОМЕРУ (DC 1–5)", callback_data="add_session_btn")],
+                [InlineKeyboardButton(text="👥 УПРАВЛЯТЬ АККАУНТАМИ", callback_data="accounts_menu")],
                 [InlineKeyboardButton(text="🔄 ОБНОВИТЬ МОДЕЛИ", callback_data="reload_models")],
                 [InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")],
             ]
@@ -2586,37 +2927,29 @@ async def reload_models_callback(callback: CallbackQuery):
     await callback.message.edit_text(f"✅ Модели обновлены. Доступно: {len(BASE_GIFTS)}", reply_markup=admin_main_keyboard())
 
 
-@dp.callback_query(F.data == "add_session_btn")
-async def add_session_btn(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await state.clear()
-    await state.set_state(AuthState.waiting_phone)
-    await callback.message.answer(
-        "📱 <b>Подключение / смена аккаунта (поддерживаются все DC 1–5)</b>\n\n"
-        "Введи номер телефона (например: <code>+79991234567</code>):\n"
-        "❌ Отмена — /cancel",
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
 # ============================================================
 # MAIN
 # ============================================================
 
 async def main():
-    global OWNERS_BLACKLIST, OWNER_CACHE, SEETG_CACHE, SENT_GIFTS, CLAIMED_LOGS, SUBSCRIPTIONS, http_session, trial_watcher_task, user_client
+    global OWNERS_BLACKLIST, OWNER_CACHE, SEETG_CACHE, SENT_GIFTS, CLAIMED_LOGS, SUBSCRIPTIONS, http_session, trial_watcher_task, accounts_watcher_task
 
     validate_config()
     await init_db()
 
-    # Загружаем сохранённую StringSession из PostgreSQL (приоритет над ENV)
-    saved_session_obj = await db_get("telethon_session", {})
-    db_session_str = saved_session_obj.get("session", "").strip() if isinstance(saved_session_obj, dict) else ""
-    active_session_str = db_session_str or TELETHON_SESSION
-    if active_session_str:
-        user_client = TelegramClient(StringSession(active_session_str), API_ID, API_HASH)
+    # Загружаем пул аккаунтов из PostgreSQL (и подхватываем одиночную сессию при миграции)
+    saved_accounts = await db_get("telethon_accounts", [])
+    if isinstance(saved_accounts, list):
+        for item in saved_accounts:
+            if isinstance(item, dict) and item.get("session"):
+                await add_account_to_pool(item["session"], save=False)
+
+    old_single = await db_get("telethon_session", {})
+    if isinstance(old_single, dict) and old_single.get("session"):
+        await add_account_to_pool(old_single["session"], save=True)
+
+    if TELETHON_SESSION:
+        await add_account_to_pool(TELETHON_SESSION, save=True)
 
     OWNERS_BLACKLIST = await db_get("owner_blacklist", {})
     OWNER_CACHE = await db_get("owner_cache", {})
@@ -2636,23 +2969,19 @@ async def main():
     connector = aiohttp.TCPConnector(family=socket.AF_INET)
     http_session = aiohttp.ClientSession(connector=connector)
     trial_watcher_task = asyncio.create_task(trial_watcher_loop())
+    accounts_watcher_task = asyncio.create_task(accounts_watcher_loop())
 
     log.info(
-        "Данные загружены из БД: ЧС=%s, кэш профилей=%s, кэш see.tg=%s, отправлено=%s, подписок=%s, моделей в настройках=%s",
-        len(OWNERS_BLACKLIST), len(OWNER_CACHE), len(SEETG_CACHE), len(SENT_GIFTS), len(SUBSCRIPTIONS["users"]), len(MONITOR_SETTINGS.get("model_ids") or [])
+        "Данные загружены: Аккаунтов в пуле=%s, ЧС=%s, кэш профилей=%s, кэш see.tg=%s, отправлено=%s, моделей=%s",
+        len(ACCOUNTS_POOL), len(OWNERS_BLACKLIST), len(OWNER_CACHE), len(SEETG_CACHE), len(SENT_GIFTS), len(MONITOR_SETTINGS.get("model_ids") or [])
     )
 
-    await ensure_user_client_connected()
-
-    if await is_user_client_authorized():
-        me = await user_client.get_me()
-        dc_id = getattr(user_client.session, "dc_id", "?")
-        log.info("Сессия Telethon активна: %s (@%s) [ID: %s | DC %s]", me.first_name, me.username, me.id, dc_id)
+    if ACCOUNTS_POOL:
         await ensure_models_loaded()
         if MONITOR_SETTINGS.get("enabled") and get_target_chat_id() and MONITOR_SETTINGS.get("model_ids"):
             await start_monitor()
     else:
-        log.warning("Сессия Telethon не авторизована. Используй /set_session или кнопку в Админ-панели.")
+        log.warning("В пуле нет аккаунтов Telethon. Добавь их через /set_session или кнопку в Админ-панели.")
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
@@ -2666,15 +2995,21 @@ async def main():
         await stop_monitor()
         if trial_watcher_task and not trial_watcher_task.done():
             trial_watcher_task.cancel()
+        if accounts_watcher_task and not accounts_watcher_task.done():
+            accounts_watcher_task.cancel()
         pending_saves = [t for t in db_save_tasks.values() if not t.done()]
         if pending_saves:
             await asyncio.gather(*pending_saves, return_exceptions=True)
+        for w in ACCOUNTS_POOL:
+            try:
+                if w.client.is_connected():
+                    await w.client.disconnect()
+            except Exception:
+                pass
         if db_pool is not None:
             await db_pool.close()
         if http_session and not http_session.closed:
             await http_session.close()
-        if user_client.is_connected():
-            await user_client.disconnect()
         await bot.session.close()
 
 
