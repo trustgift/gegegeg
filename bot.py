@@ -36,6 +36,8 @@ from telethon.errors import (
     RpcMcgetFailError,
     SessionPasswordNeededError,
     AuthKeyUnregisteredError,
+    AuthKeyDuplicatedError,
+    FrozenMethodInvalidError,
     UserDeactivatedBanError,
     UserDeactivatedError,
     PhoneCodeInvalidError,
@@ -54,6 +56,7 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELETHON_SESSION = os.getenv("TELETHON_SESSION", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 ADMIN_IDS: Set[int] = {
     int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
@@ -70,16 +73,16 @@ MAX_KEY_TRANSFERS = 3             # Максимум переносов подп
 # Настройки API see.tg (kartoshka.free)
 SEETG_TOKEN = os.getenv("SEETG_TOKEN", "").strip()
 SEETG_BASE_URL = "https://kartoshka.free/v1"
-SEETG_REQUEST_DELAY = 0.6
+SEETG_REQUEST_DELAY = 0.35
 
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 
-# СБАЛАНСИРОВАННОЕ УСКОРЕНИЕ (~2x БЫСТРЕЕ ИСХОДНОГО, БЕЗ ПЕРЕГРУЗА)
-MONITOR_INTERVAL = 8        # Пауза между кругами обхода (сек)
+# БЫСТРЫЙ ПАРАЛЛЕЛЬНЫЙ РЕЖИМ (масштабируется от кол-ва аккаунтов в пуле)
+MONITOR_INTERVAL = 4        # Пауза между кругами обхода (сек)
 MONITOR_PAGE_LIMIT = 2      # Проверять 2 самых свежих лота с модели за круг
-PER_ACCOUNT_DELAY = 1.5     # Персональная задержка на каждый аккаунт в пуле (сек)
-MONITOR_SEND_DELAY = 0.3    # Пауза между отправкой сообщений в чат (сек)
-MODEL_STEP_DELAY = 0.45     # Пауза при переходе к следующей модели (сек)
+PER_ACCOUNT_DELAY = 1.2     # Персональная задержка на каждый аккаунт в пуле (сек)
+MONITOR_SEND_DELAY = 0.2    # Пауза между отправкой сообщений в чат (сек)
+BATCH_STEP_DELAY = 0.25     # Пауза между пачками моделей (сек)
 
 # ФИЛЬТРЫ ПО УМОЛЧАНИЮ ("НЕ ШАРЯЩИЕ")
 DEFAULT_MAX_NFT_GIFTS = 3        # Максимум 3 NFT-подарка в профиле
@@ -90,6 +93,7 @@ DEFAULT_MAX_PRICE = 0
 DEFAULT_USERNAME_MODE = "required"
 DEFAULT_STRICT_NEWBIE = True     # Отсеивать тех, у кого свой канал или слова скупа/NFT в био
 DEFAULT_NO_PREMIUM = True        # Отсеивать пользователей с Telegram Premium
+DEFAULT_AI_FILTER = True         # ИИ-фильтр через Google Gemini API (работает при наличии ключа)
 
 TRADER_STOP_WORDS = (
     "nft", "нфт", "gift", "гифт", "подарк", "скуп", "продам", "куплю",
@@ -97,6 +101,15 @@ TRADER_STOP_WORDS = (
     "канал", "t.me/", "http", "shop", "store", "market", "маркет",
     "trade", "трейд", "p2p", "обмен", "admin", "manager", "менеджер",
 )
+
+DEAD_SESSION_ERRORS = (
+    AuthKeyUnregisteredError,
+    AuthKeyDuplicatedError,
+    FrozenMethodInvalidError,
+    UserDeactivatedBanError,
+    UserDeactivatedError,
+)
+SUPPORTS_STARS_ONLY_PARAM = True
 
 SEND_EXISTING_ON_FIRST_SCAN = False
 GIFTS_PER_PAGE = 8
@@ -199,6 +212,8 @@ MONITOR_SETTINGS: Dict[str, Any] = {
     "max_rating_level": DEFAULT_MAX_RATING,
     "strict_newbie_mode": DEFAULT_STRICT_NEWBIE,
     "no_premium_only": DEFAULT_NO_PREMIUM,
+    "ai_filter_enabled": DEFAULT_AI_FILTER,
+    "gemini_api_key": GEMINI_API_KEY,
 }
 
 monitor_task: Optional[asyncio.Task] = None
@@ -223,7 +238,91 @@ async def notify_admins(text: str) -> None:
 
 
 # ============================================================
-# MULTI-ACCOUNT POOL (АВТО-ОТКЛЮЧЕНИЕ И ВОЗВРАТ ПОСЛЕ FLOODWAIT)
+# GOOGLE GEMINI AI FILTER ("АНТИ-СКУП / ПОИСК НЕ ШАРЯЩИХ")
+# ============================================================
+
+def get_active_gemini_key() -> str:
+    return (MONITOR_SETTINGS.get("gemini_api_key") or GEMINI_API_KEY or "").strip()
+
+
+async def check_owner_with_gemini_ai(owner: "OwnerInfo", gift_title: str, price: int) -> tuple[bool, str]:
+    """
+    Возвращает (is_newbie_target, reason).
+    True = обычный юзер ("бомж"/новичок), отправляем лог.
+    False = перекуп/твинк/шарящий, отбрасываем.
+    """
+    global http_session
+    if not MONITOR_SETTINGS.get("ai_filter_enabled"):
+        return True, "ИИ выключен"
+
+    api_key = get_active_gemini_key()
+    if not api_key:
+        return True, "нет ключа Gemini"
+
+    if http_session is None or http_session.closed:
+        connector = aiohttp.TCPConnector(family=socket.AF_INET)
+        http_session = aiohttp.ClientSession(connector=connector)
+
+    prompt = (
+        "Ты антифрод-аналитик Telegram NFT маркета. Определи, является ли продавец обычным простым пользователем "
+        "(«новичком» / «не шарящим», который случайно или по незнанию выставил подарок), ИЛИ это скрытый перекуп, "
+        "трейдер, твинк скупа, крипто-юзер или опытный коллекционер.\n\n"
+        f"Данные продавца:\n"
+        f"- Имя: {owner.label}\n"
+        f"- Username: @{owner.username or 'нет'}\n"
+        f"- Био (О себе): {owner.bio or 'пусто'}\n"
+        f"- Рейтинг звёзд: {owner.rating_level}\n"
+        f"- Всего подарков: {owner.total_gifts_count} (из них NFT: {owner.nft_gifts_count})\n"
+        f"- Telegram Premium: {'да' if owner.is_premium else 'нет'}\n"
+        f"- Выставил подарок: {gift_title} за {price} Stars\n\n"
+        "Признаки перекупа/твинка: сленг крипты/NFT/трейдинга, ссылки, шаблонные никнеймы ферм/авторегов, "
+        "слишком много подарков или завышенный рейтинг.\n"
+        "Ответь СТРОГО в формате JSON без markdown: "
+        '{"pass": true/false, "reason": "кратко до 6 слов на русском"}'
+    )
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 90,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    try:
+        async with http_session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status != 200:
+                err_txt = await resp.text()
+                log.warning("Gemini API HTTP %s: %s", resp.status, err_txt[:150])
+                return True, "ошибка API (пропущен по умолчанию)"
+
+            data = await resp.json()
+            candidates = data.get("candidates") or []
+            if not candidates:
+                return True, "пустой ответ ИИ"
+
+            raw_text = (
+                candidates[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+                .strip()
+            )
+            raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(raw_text)
+            passed = bool(parsed.get("pass", True))
+            reason = str(parsed.get("reason") or "оценка ИИ").strip()
+            return passed, reason
+
+    except Exception as e:
+        log.warning("Gemini AI check fallback (%s)", e)
+        return True, "таймаут ИИ"
+
+
+# ============================================================
+# MULTI-ACCOUNT POOL (АВТО-ОТКЛЮЧЕНИЕ, УВЕДОМЛЕНИЯ, ВОЗВРАТ)
 # ============================================================
 
 @dataclass
@@ -296,13 +395,21 @@ async def handle_dead_session(worker: AccountWorker, reason: str) -> None:
     except Exception:
         pass
 
+    human_reason = {
+        "FrozenMethodInvalidError": "Аккаунт заморожен Telegram (Frozen)",
+        "AuthKeyDuplicatedError": "Сессия использовалась с двух IP одновременно (AuthKeyDuplicated)",
+        "AuthKeyUnregisteredError": "Сессия разлогинена (AuthKeyUnregistered)",
+        "UserDeactivatedBanError": "Аккаунт заблокирован Telegram (Banned)",
+        "UserDeactivatedError": "Аккаунт удалён (Deactivated)",
+    }.get(reason, reason)
+
     active_left = get_active_accounts_count()
     total = len(ACCOUNTS_POOL)
-    log.error("❌ Сессия %s слетела (%s) и удалена из пула!", worker.label, reason)
+    log.error("❌ Сессия %s отлетела (%s) и удалена из пула!", worker.label, human_reason)
     await notify_admins(
-        f"🚨 <b>СЛЕТЕЛА СЕССИЯ АККАУНТА!</b>\n\n"
+        f"🚨 <b>ПРОБЛЕМА С АККАУНТОМ (УДАЛЁН ИЗ ПУЛА)!</b>\n\n"
         f"👤 Профиль: <b>{escape_text(worker.label)}</b> [ID: <code>{worker.user_id}</code>]\n"
-        f"❌ Причина: <code>{escape_text(reason)}</code>\n"
+        f"❌ Причина: <b>{escape_text(human_reason)}</b>\n"
         f"📊 Осталось в пуле: <b>{active_left} активных / {total} всего</b>\n\n"
         "Добавь замену через /set_session или в меню 👥 АККАУНТЫ."
     )
@@ -438,15 +545,15 @@ async def accounts_watcher_loop() -> None:
                         f"📊 Активных в пуле: <b>{active_now} из {total}</b>"
                     )
 
-            if now - last_health_check >= 180:
+            if now - last_health_check >= 120:
                 last_health_check = now
                 for w in list(ACCOUNTS_POOL):
                     try:
                         if not w.client.is_connected():
                             await w.client.connect()
                         if not await w.client.is_user_authorized():
-                            await handle_dead_session(w, "Сессия разлогинена (is_user_authorized = False)")
-                    except (AuthKeyUnregisteredError, UserDeactivatedBanError, UserDeactivatedError) as e:
+                            await handle_dead_session(w, "AuthKeyUnregisteredError")
+                    except DEAD_SESSION_ERRORS as e:
                         await handle_dead_session(w, e.__class__.__name__)
                     except Exception as e:
                         log.warning("Ошибка проверки здоровья сессии %s: %s", w.label, e)
@@ -477,6 +584,7 @@ class OwnerInfo:
     label: str
     username: Optional[str] = None
     user_id: Optional[int] = None
+    bio: str = ""
     nft_gifts_count: int = 0
     total_gifts_count: int = 0
     rating_level: int = 0
@@ -510,6 +618,7 @@ class AuthState(StatesGroup):
     waiting_code = State()
     waiting_password = State()
     waiting_string_session = State()
+    waiting_gemini_key = State()
 
 
 class MonitorPriceState(StatesGroup):
@@ -681,6 +790,10 @@ def apply_loaded_settings(data: Any) -> None:
     MONITOR_SETTINGS["max_rating_level"] = max(0, int(data.get("max_rating_level", DEFAULT_MAX_RATING) or 0))
     MONITOR_SETTINGS["strict_newbie_mode"] = bool(data.get("strict_newbie_mode", DEFAULT_STRICT_NEWBIE))
     MONITOR_SETTINGS["no_premium_only"] = bool(data.get("no_premium_only", DEFAULT_NO_PREMIUM))
+    MONITOR_SETTINGS["ai_filter_enabled"] = bool(data.get("ai_filter_enabled", DEFAULT_AI_FILTER))
+
+    db_gemini_key = str(data.get("gemini_api_key", "") or "").strip()
+    MONITOR_SETTINGS["gemini_api_key"] = db_gemini_key or GEMINI_API_KEY
 
     username_mode = str(data.get("username_mode", DEFAULT_USERNAME_MODE)).lower()
     MONITOR_SETTINGS["username_mode"] = username_mode if username_mode in {"any", "required"} else "required"
@@ -1106,7 +1219,7 @@ async def fetch_user_nft_gifts_count(worker: AccountWorker, peer: Any, user_id: 
     except FloodWaitError as e:
         set_worker_flood(worker, e.seconds, "GetSavedStarGifts")
         return 0
-    except (AuthKeyUnregisteredError, UserDeactivatedBanError, UserDeactivatedError) as e:
+    except DEAD_SESSION_ERRORS as e:
         await handle_dead_session(worker, e.__class__.__name__)
         return 0
     except Exception as e:
@@ -1131,7 +1244,6 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
     if not owner_id and not seetg_username:
         return None
 
-    # Если нужны только юзеры с @username, а see.tg вернул пустой username — не тратим запрос Telethon
     if MONITOR_SETTINGS.get("username_mode") == "required" and not seetg_username:
         cached = OWNER_CACHE.get(str(owner_id)) if owner_id else None
         if not cached or not cached.get("username"):
@@ -1141,7 +1253,7 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
         cache_key = str(owner_id)
         cached = OWNER_CACHE.get(cache_key)
 
-        if cached and cached.get("v") == 3:
+        if cached and cached.get("v") == 4:
             username = cached.get("username") or seetg_username or None
             label = cached.get("label") or seetg_name or f"id:{owner_id}"
             key = f"username:{username.lower()}" if username else f"id:{owner_id}"
@@ -1150,6 +1262,7 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
                 label=label,
                 username=username,
                 user_id=owner_id,
+                bio=cached.get("bio", ""),
                 nft_gifts_count=cached.get("nft_gifts_count", 0),
                 total_gifts_count=cached.get("total_gifts_count", 0),
                 rating_level=cached.get("rating_level", 0),
@@ -1217,10 +1330,11 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
                 nft_gifts_count = await fetch_user_nft_gifts_count(worker, peer, owner_id, max_to_check=max_nft + 1)
 
             OWNER_CACHE[cache_key] = {
-                "v": 3,
+                "v": 4,
                 "label": label,
                 "username": username or "",
                 "user_id": owner_id,
+                "bio": about,
                 "nft_gifts_count": nft_gifts_count,
                 "total_gifts_count": total_gifts,
                 "rating_level": rating_level,
@@ -1241,6 +1355,7 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
                 label=label,
                 username=username,
                 user_id=owner_id,
+                bio=about,
                 nft_gifts_count=nft_gifts_count,
                 total_gifts_count=total_gifts,
                 rating_level=rating_level,
@@ -1253,7 +1368,7 @@ async def resolve_owner_info(raw_gift: Any) -> Optional[OwnerInfo]:
         except FloodWaitError as e:
             set_worker_flood(worker, e.seconds, "GetFullUser")
             return None
-        except (AuthKeyUnregisteredError, UserDeactivatedBanError, UserDeactivatedError) as e:
+        except DEAD_SESSION_ERRORS as e:
             await handle_dead_session(worker, e.__class__.__name__)
             return None
         except Exception as e:
@@ -1273,25 +1388,14 @@ async def get_resale_page(
     limit: int = REQUEST_PAGE_LIMIT,
     sort_by_price: bool = False,
 ):
+    global SUPPORTS_STARS_ONLY_PARAM
     for _ in range(3):
         worker = await acquire_worker()
         if worker is None:
             return None
         try:
-            try:
-                return await worker.client(
-                    functions.payments.GetResaleStarGiftsRequest(
-                        gift_id=gift_id,
-                        offset=offset,
-                        limit=limit,
-                        sort_by_price=sort_by_price,
-                        sort_by_num=False,
-                        stars_only=True,
-                        for_craft=False,
-                    )
-                )
-            except TypeError as e:
-                if "stars_only" in str(e) or "for_craft" in str(e):
+            if SUPPORTS_STARS_ONLY_PARAM:
+                try:
                     return await worker.client(
                         functions.payments.GetResaleStarGiftsRequest(
                             gift_id=gift_id,
@@ -1299,17 +1403,33 @@ async def get_resale_page(
                             limit=limit,
                             sort_by_price=sort_by_price,
                             sort_by_num=False,
+                            stars_only=True,
+                            for_craft=False,
                         )
                     )
-                raise
+                except TypeError as e:
+                    if "stars_only" in str(e) or "for_craft" in str(e):
+                        SUPPORTS_STARS_ONLY_PARAM = False
+                    else:
+                        raise
+
+            return await worker.client(
+                functions.payments.GetResaleStarGiftsRequest(
+                    gift_id=gift_id,
+                    offset=offset,
+                    limit=limit,
+                    sort_by_price=sort_by_price,
+                    sort_by_num=False,
+                )
+            )
 
         except FloodWaitError as e:
             set_worker_flood(worker, e.seconds, "GetResaleStarGifts")
-        except (AuthKeyUnregisteredError, UserDeactivatedBanError, UserDeactivatedError) as e:
+        except DEAD_SESSION_ERRORS as e:
             await handle_dead_session(worker, e.__class__.__name__)
         except RpcMcgetFailError:
-            log.warning("Временный сбой серверов Telegram (RpcMcgetFailError), ждём 3 сек...")
-            await asyncio.sleep(3)
+            log.warning("Временный сбой серверов Telegram (RpcMcgetFailError), ждём 2.5 сек...")
+            await asyncio.sleep(2.5)
     return None
 
 
@@ -1321,7 +1441,7 @@ def is_stars_only_listing(raw_gift: Any) -> bool:
 
 
 # ============================================================
-# MONITORING LOGIC (ОБЩИЙ ЧАТ + КНОПКА "ЗАБРАТЬ ЛОГ")
+# MONITORING LOGIC (ПАРАЛЛЕЛЬНЫЙ ОБХОД + ИИ-ПРОВЕРКА)
 # ============================================================
 
 async def get_monitor_models() -> List[BaseGift]:
@@ -1332,7 +1452,7 @@ async def get_monitor_models() -> List[BaseGift]:
     return [g for g in BASE_GIFTS if g.gift_id in selected and g.availability_resale > 0]
 
 
-async def send_monitor_gift(market_gift: MarketGift, base_gift: BaseGift) -> bool:
+async def send_monitor_gift(market_gift: MarketGift, base_gift: BaseGift, ai_note: str = "") -> bool:
     target_chat_id = get_target_chat_id()
     if not target_chat_id:
         return False
@@ -1342,6 +1462,7 @@ async def send_monitor_gift(market_gift: MarketGift, base_gift: BaseGift) -> boo
     rating_display = str(owner.rating_level) if owner.rating_level > 0 else "0 / новичок"
     profile_line = f"{owner.nft_gifts_count} NFT (всего: {owner.total_gifts_count} шт.)"
     prem_tag = "без Premium" if not owner.is_premium else "с Premium"
+    ai_block = f"🧠 <b>Вердикт ИИ:</b> {escape_text(ai_note)}\n" if ai_note and MONITOR_SETTINGS.get("ai_filter_enabled") and get_active_gemini_key() else ""
 
     public_text = (
         "🚨 <b>НОВЫЙ ЛОГ (STARS)</b>\n\n"
@@ -1349,7 +1470,8 @@ async def send_monitor_gift(market_gift: MarketGift, base_gift: BaseGift) -> boo
         f"📦 <b>Модель:</b> {escape_text(base_gift.title)}\n"
         f"💰 <b>Цена:</b> {market_gift.price} ⭐\n"
         f"👑 <b>Рейтинг владельца:</b> {rating_display}\n"
-        f"🖼 <b>Профиль:</b> {profile_line} • {prem_tag}\n\n"
+        f"🖼 <b>Профиль:</b> {profile_line} • {prem_tag}\n"
+        f"{ai_block}\n"
         "👇 Нажми кнопку ниже, чтобы забрать контакт себе в ЛС:"
     )
 
@@ -1445,6 +1567,13 @@ async def process_monitor_model(base_gift: BaseGift, first_scan: bool) -> int:
                 SENT_GIFTS[slug] = {"skipped": reason, "gift_id": base_gift.gift_id}
                 continue
 
+            # ИИ-фильтр через Google Gemini API (если включён)
+            ai_ok, ai_reason = await check_owner_with_gemini_ai(owner, base_gift.title, price)
+            if not ai_ok:
+                log.info("🤖 ИИ отсеял %s (%s): %s", slug, owner.display, ai_reason)
+                SENT_GIFTS[slug] = {"skipped": f"AI: {ai_reason}", "gift_id": base_gift.gift_id}
+                continue
+
             market_gift = MarketGift(
                 title=str(get_field(raw, "title") or base_gift.title),
                 num=safe_int(get_field(raw, "num")),
@@ -1460,7 +1589,7 @@ async def process_monitor_model(base_gift: BaseGift, first_scan: bool) -> int:
                 "gift_id": base_gift.gift_id,
             }
 
-            sent = await send_monitor_gift(market_gift, base_gift)
+            sent = await send_monitor_gift(market_gift, base_gift, ai_note=ai_reason)
             if sent:
                 await asyncio.sleep(MONITOR_SEND_DELAY)
                 sent_count += 1
@@ -1480,22 +1609,31 @@ async def monitor_cycle(first_scan: bool = False) -> int:
             return 0
 
         total_sent = 0
-        for index, model in enumerate(models, 1):
+        idx = 0
+        while idx < len(models):
             if not MONITOR_SETTINGS.get("enabled"):
                 break
-            if get_active_accounts_count() == 0:
+            active_accs = get_active_accounts_count()
+            if active_accs == 0:
                 break
-            try:
-                sent = await process_monitor_model(model, first_scan)
-                total_sent += sent
-                if sent:
-                    save_sent_gifts()
-                    log.info("Монитор: %s/%s | %s | отправлено=%s", index, len(models), model.title, sent)
-                await asyncio.sleep(MODEL_STEP_DELAY)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log.exception("Ошибка в очереди модели %s: %s", model.title, e)
+
+            # Параллельно проверяем столько моделей, сколько активных аккаунтов в пуле (до 5)
+            batch_size = min(5, max(1, active_accs))
+            batch = models[idx:idx + batch_size]
+            idx += batch_size
+
+            results = await asyncio.gather(
+                *(process_monitor_model(m, first_scan) for m in batch),
+                return_exceptions=True,
+            )
+            for model, res in zip(batch, results):
+                if isinstance(res, int) and res > 0:
+                    total_sent += res
+                    log.info("Монитор: %s | отправлено=%s", model.title, res)
+
+            if total_sent > 0:
+                save_sent_gifts()
+            await asyncio.sleep(BATCH_STEP_DELAY)
 
         if total_sent > 0 or first_scan:
             save_sent_gifts()
@@ -1509,12 +1647,10 @@ async def monitor_loop() -> None:
     monitor_first_scan_done = False
 
     log.info(
-        "Монитор запущен (акков в пуле: %s, интервал: %s сек). Рейтинг <%s, Макс. NFT: %s, Макс. всего: %s",
+        "Монитор запущен (акков в пуле: %s, интервал: %s сек, ИИ: %s).",
         len(ACCOUNTS_POOL),
         MONITOR_INTERVAL,
-        MONITOR_SETTINGS.get("max_rating_level"),
-        MONITOR_SETTINGS.get("max_owner_nft_gifts"),
-        MONITOR_SETTINGS.get("max_owner_total_gifts"),
+        "ВКЛ" if (MONITOR_SETTINGS.get("ai_filter_enabled") and get_active_gemini_key()) else "ВЫКЛ",
     )
 
     try:
@@ -1527,7 +1663,7 @@ async def monitor_loop() -> None:
                 break
 
             if get_active_accounts_count() == 0:
-                await asyncio.sleep(5)
+                await asyncio.sleep(4)
                 continue
 
             await monitor_cycle(first_scan=first_scan)
@@ -1656,6 +1792,7 @@ def monitor_keyboard() -> InlineKeyboardMarkup:
     enabled = bool(MONITOR_SETTINGS.get("enabled"))
     strict_on = bool(MONITOR_SETTINGS.get("strict_newbie_mode", True))
     no_prem = bool(MONITOR_SETTINGS.get("no_premium_only", True))
+    ai_on = bool(MONITOR_SETTINGS.get("ai_filter_enabled", True))
 
     rows = []
     if enabled:
@@ -1683,6 +1820,16 @@ def monitor_keyboard() -> InlineKeyboardMarkup:
             ),
         ],
         [
+            InlineKeyboardButton(
+                text=f"🧠 ИИ-ФИЛЬТР: {'ВКЛ' if ai_on else 'ВЫКЛ'}",
+                callback_data="monitor_toggle_ai",
+            ),
+            InlineKeyboardButton(
+                text="🔑 GEMINI КЛЮЧ",
+                callback_data="monitor_set_gemini",
+            ),
+        ],
+        [
             InlineKeyboardButton(text="👤 USERNAME", callback_data="monitor_username"),
             InlineKeyboardButton(text="🎁 МОДЕЛИ", callback_data="monitor_models"),
         ],
@@ -1702,6 +1849,8 @@ def monitor_status_text() -> str:
     max_total = safe_int(MONITOR_SETTINGS.get("max_owner_total_gifts"), 0)
     strict_on = bool(MONITOR_SETTINGS.get("strict_newbie_mode", True))
     no_prem = bool(MONITOR_SETTINGS.get("no_premium_only", True))
+    ai_on = bool(MONITOR_SETTINGS.get("ai_filter_enabled", True))
+    has_ai_key = bool(get_active_gemini_key())
 
     if min_price and max_price:
         price_text = f"{min_price}—{max_price} ⭐"
@@ -1721,9 +1870,16 @@ def monitor_status_text() -> str:
     nft_info = f"макс. {max_nft} шт." if max_nft > 0 else "выкл"
     total_info = f"макс. {max_total} шт." if max_total > 0 else "выкл"
 
+    if ai_on and has_ai_key:
+        ai_status = "✅ ВКЛ (Gemini 2.5 Flash)"
+    elif ai_on and not has_ai_key:
+        ai_status = "⚠️ ВКЛ, но не задан GEMINI_API_KEY"
+    else:
+        ai_status = "❌ ВЫКЛ"
+
     active_accs = get_active_accounts_count()
     total_accs = len(ACCOUNTS_POOL)
-    eff_delay = round(PER_ACCOUNT_DELAY / max(1, active_accs), 2) if active_accs else PER_ACCOUNT_DELAY
+    parallel_batch = min(5, max(1, active_accs)) if active_accs else 1
 
     flood_rem = get_min_flood_wait_remaining()
     flood_line = (
@@ -1734,16 +1890,17 @@ def monitor_status_text() -> str:
     )
 
     return (
-        "📡 <b>АВТОМАТИЧЕСКИЙ МОНИТОРИНГ (2X + ПУЛ АККОВ)</b>\n\n"
+        "📡 <b>АВТОМАТИЧЕСКИЙ МОНИТОРИНГ (ТУРБО + ИИ)</b>\n\n"
         f"Статус: {'🟢 РАБОТАЕТ' if enabled else '🔴 ОСТАНОВЛЕН'}\n"
-        f"Аккаунтов в работе: <b>{active_accs} из {total_accs}</b> (~{eff_delay} сек/запрос)\n"
+        f"Аккаунтов в работе: <b>{active_accs} из {total_accs}</b> (потоков: {parallel_batch}x)\n"
         f"Интервал круга: <b>{MONITOR_INTERVAL} сек.</b> (глубина: {MONITOR_PAGE_LIMIT} лота)\n"
         f"Целевая группа: <code>{escape_text(target_text)}</code>\n"
         f"Диапазон цены: <b>{escape_text(price_text)}</b>\n"
         f"Фильтр рейтинга: <b>{escape_text(rating_info)}</b>\n"
         f"NFT / Всего подарков: <b>{escape_text(nft_info)} / {escape_text(total_info)}</b>\n"
-        f"Режим «Не шарящие»: <b>{'✅ ВКЛ (без каналов и био скупов)' if strict_on else '❌ ВЫКЛ'}</b>\n"
+        f"Режим «Не шарящие»: <b>{'✅ ВКЛ' if strict_on else '❌ ВЫКЛ'}</b>\n"
         f"Фильтр Premium: <b>{'✅ только без Premium' if no_prem else 'любые'}</b>\n"
+        f"ИИ-фильтр Gemini: <b>{ai_status}</b>\n"
         f"Юзернейм: <b>{escape_text(username_text)}</b>\n"
         f"Модели: <b>{escape_text(model_text)}</b>\n"
         f"See.tg: Free <b>{SEETG_BILLING['free_remaining']}</b> | Баланс <b>{SEETG_BILLING['balance_ton']} TON</b>\n"
@@ -2234,12 +2391,12 @@ def accounts_menu_keyboard() -> InlineKeyboardMarkup:
 def accounts_menu_text() -> str:
     active = get_active_accounts_count()
     total = len(ACCOUNTS_POOL)
-    eff_speed = round(PER_ACCOUNT_DELAY / max(1, active), 2) if active else PER_ACCOUNT_DELAY
+    parallel_batch = min(5, max(1, active)) if active else 1
 
     lines = [
         "👥 <b>УПРАВЛЕНИЕ ПУЛОМ АККАУНТОВ TELETHON</b>\n",
         f"Активных аккаунтов: <b>{active} из {total}</b>",
-        f"Эффективная скорость: <b>1 запрос каждые ~{eff_speed} сек.</b>\n",
+        f"Параллельных потоков: <b>{parallel_batch}x</b>\n",
     ]
     if not ACCOUNTS_POOL:
         lines.append("⚠️ Пул пуст. Добавь хотя бы 1 аккаунт ниже.")
@@ -2473,7 +2630,7 @@ async def paste_session_input(message: Message, state: FSMContext):
 
 
 # ============================================================
-# АДМИН-МЕНЮ И НАСТРОЙКИ МОНИТОРИНГА
+# АДМИН-МЕНЮ И НАСТРОЙКИ МОНИТОРИНГА (+ УПРАВЛЕНИЕ ИИ)
 # ============================================================
 
 @dp.callback_query(F.data == "menu")
@@ -2549,6 +2706,68 @@ async def monitor_toggle_premium_callback(callback: CallbackQuery):
     save_monitor_settings()
     await callback.message.edit_text(monitor_status_text(), parse_mode="HTML", reply_markup=monitor_keyboard())
     await callback.answer()
+
+
+@dp.callback_query(F.data == "monitor_toggle_ai")
+async def monitor_toggle_ai_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    new_state = not bool(MONITOR_SETTINGS.get("ai_filter_enabled", True))
+    if new_state and not get_active_gemini_key():
+        await callback.answer("⚠️ Сначала задай ключ через кнопку «🔑 GEMINI КЛЮЧ» или ENV GEMINI_API_KEY!", show_alert=True)
+        return
+    MONITOR_SETTINGS["ai_filter_enabled"] = new_state
+    save_monitor_settings()
+    await callback.message.edit_text(monitor_status_text(), parse_mode="HTML", reply_markup=monitor_keyboard())
+    await callback.answer(f"🧠 ИИ-фильтр {'включён' if new_state else 'выключен'}.")
+
+
+@dp.callback_query(F.data == "monitor_set_gemini")
+async def monitor_set_gemini_callback(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AuthState.waiting_gemini_key)
+    await callback.message.answer(
+        "🔑 <b>НАСТРОЙКА GOOGLE GEMINI API КЛЮЧА</b>\n\n"
+        "Отправь сюда твой ключ от Google AI Studio (начинается на <code>AIza...</code>).\n"
+        "Чтобы удалить ключ — отправь <code>0</code>.\n\n"
+        "❌ Отмена — /cancel",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.message(AuthState.waiting_gemini_key)
+async def monitor_set_gemini_input(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    val = (message.text or "").strip()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    if val == "0":
+        MONITOR_SETTINGS["gemini_api_key"] = ""
+        MONITOR_SETTINGS["ai_filter_enabled"] = False
+        save_monitor_settings()
+        await state.clear()
+        await message.answer("🗑 Gemini API ключ удалён, ИИ-фильтр выключен.", reply_markup=monitor_keyboard())
+        return
+
+    if not val.startswith("AIza") or len(val) < 25:
+        await message.answer("❌ Неверный формат ключа (должен начинаться на <code>AIza...</code>). Попробуй ещё раз или /cancel.", parse_mode="HTML")
+        return
+
+    MONITOR_SETTINGS["gemini_api_key"] = val
+    MONITOR_SETTINGS["ai_filter_enabled"] = True
+    save_monitor_settings()
+    await state.clear()
+    await message.answer(
+        "✅ <b>Google Gemini API ключ сохранён, ИИ-фильтр включён!</b>",
+        parse_mode="HTML",
+        reply_markup=monitor_keyboard(),
+    )
 
 
 @dp.callback_query(F.data == "monitor_username")
@@ -2897,6 +3116,7 @@ async def admin_panel(callback: CallbackQuery):
     await callback.message.edit_text(
         "⚙️ <b>СТАТИСТИКА И АДМИН-ПАНЕЛЬ</b>\n\n"
         f"👥 Аккаунтов в пуле: <b>{get_active_accounts_count()} активных / {len(ACCOUNTS_POOL)} всего</b>\n"
+        f"🧠 ИИ Gemini: <b>{'✅ ВКЛ' if (MONITOR_SETTINGS.get('ai_filter_enabled') and get_active_gemini_key()) else '❌ ВЫКЛ'}</b>\n"
         f"🗄 База данных: {'✅ PostgreSQL' if db_pool else '⚠️ Локальная'}\n"
         f"👑 Админов: {len([x for x in ADMIN_IDS if x > 0])}\n"
         f"💎 Подписок навсегда: <b>{lifetime_count}</b> | Триал: <b>{trial_count}</b>\n"
