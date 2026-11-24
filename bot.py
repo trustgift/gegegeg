@@ -94,15 +94,16 @@ DEFAULT_USERNAME_MODE = "required"
 DEFAULT_STRICT_NEWBIE = True     # Отсеивать тех, у кого свой канал или слова скупа/NFT в био
 DEFAULT_NO_PREMIUM = True        # Отсеивать пользователей с Telegram Premium
 DEFAULT_AI_FILTER = True         # ИИ-фильтр через Google Gemini API
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 
-# Кандидаты моделей для проверки доступности по ключу
+# Резервные модели, если список /v1beta/models недоступен
 GEMINI_CANDIDATE_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.0-flash",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-2.5-pro",
     "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
 ]
 
 TRADER_STOP_WORDS = (
@@ -263,67 +264,75 @@ def get_active_gemini_model() -> str:
 
 def build_gemini_generate_url(api_key: str, model_name: str) -> str:
     clean_model = model_name.replace("models/", "").strip()
-    if api_key.startswith("AQ."):
-        return f"https://aiplatform.googleapis.com/v1/publishers/google/models/{clean_model}:generateContent?key={api_key}"
     return f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={api_key}"
 
 
 async def discover_gemini_models_for_key(api_key: str) -> tuple[bool, List[str], str]:
     """
-    Проверяет ключ (AIza... или AQ....) и определяет, какие модели Gemini можно подключить.
-    Возвращает: (успех, список_доступных_моделей, текст_ошибки_или_статуса)
+    Запрашивает актуальный список моделей из Google AI Studio (/v1beta/models)
+    для любого ключа (AIza... и AQ....) и проверяет рабочую генерацию.
     """
     global http_session
     if http_session is None or http_session.closed:
         connector = aiohttp.TCPConnector(family=socket.AF_INET)
         http_session = aiohttp.ClientSession(connector=connector)
 
-    available: List[str] = []
+    fetched_models: List[str] = []
     last_error = ""
 
-    # 1. Для классических AI Studio ключей (AIza...) запрашиваем официальный /v1beta/models
-    if not api_key.startswith("AQ."):
-        list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    # 1. Получаем актуальный список доступных моделей для этого ключа
+    list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    try:
+        async with http_session.get(list_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                for m in data.get("models") or []:
+                    methods = m.get("supportedGenerationMethods") or []
+                    name = str(m.get("name") or "").replace("models/", "")
+                    if "generateContent" in methods and "gemini" in name.lower():
+                        if not any(bad in name.lower() for bad in ("embedding", "imagen", "veo", "tts", "audio", "robotics", "computer-use")):
+                            fetched_models.append(name)
+            else:
+                err_data = await resp.text()
+                last_error = f"HTTP {resp.status}: {err_data[:180]}"
+    except Exception as e:
+        last_error = str(e)
+
+    # Приоритет быстрым flash-моделям (сначала актуальные flash, затем flash-lite и pro)
+    def model_sort_key(m_name: str) -> tuple[int, str]:
+        low = m_name.lower()
+        if "flash-lite" in low:
+            return (1, low)
+        if "flash" in low and "exp" not in low:
+            return (0, low)
+        if "pro" in low:
+            return (2, low)
+        return (3, low)
+
+    candidates = sorted(dict.fromkeys(fetched_models), key=model_sort_key) or GEMINI_CANDIDATE_MODELS
+
+    # 2. Проверяем первые 6 кандидатов реальным тестовым запросом
+    working: List[str] = []
+    ping_payload = {
+        "contents": [{"parts": [{"text": "OK"}]}],
+        "generationConfig": {"maxOutputTokens": 5, "temperature": 0.0},
+    }
+    for candidate in candidates[:6]:
+        url = build_gemini_generate_url(api_key, candidate)
         try:
-            async with http_session.get(list_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with http_session.post(url, json=ping_payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
-                    for m in data.get("models") or []:
-                        methods = m.get("supportedGenerationMethods") or []
-                        name = str(m.get("name") or "").replace("models/", "")
-                        if "generateContent" in methods and "gemini" in name.lower():
-                            if not any(bad in name.lower() for bad in ("embedding", "imagen", "veo", "tts", "audio")):
-                                available.append(name)
+                    working.append(candidate)
                 else:
-                    err_data = await resp.text()
-                    last_error = f"HTTP {resp.status}: {err_data[:140]}"
+                    err_txt = await resp.text()
+                    last_error = f"HTTP {resp.status}: {err_txt[:180]}"
         except Exception as e:
             last_error = str(e)
 
-    # 2. Если список пуст или это ключ AQ. (Vertex Express) — пингуем каждую кандидат-модель напрямую
-    if not available:
-        ping_payload = {
-            "contents": [{"parts": [{"text": "Reply OK"}]}],
-            "generationConfig": {"maxOutputTokens": 5, "temperature": 0.0},
-        }
-        for candidate in GEMINI_CANDIDATE_MODELS:
-            url = build_gemini_generate_url(api_key, candidate)
-            try:
-                async with http_session.post(url, json=ping_payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                    if resp.status == 200:
-                        available.append(candidate)
-                    else:
-                        err_txt = await resp.text()
-                        last_error = f"HTTP {resp.status}: {err_txt[:140]}"
-            except Exception as e:
-                last_error = str(e)
+    all_available = list(dict.fromkeys(working + candidates))
 
-    # Сортируем так, чтобы приоритетные модели (2.5-flash и 2.5-flash-lite) шли первыми
-    priority = {m: idx for idx, m in enumerate(GEMINI_CANDIDATE_MODELS)}
-    available = sorted(dict.fromkeys(available), key=lambda x: (priority.get(x, 99), x))
-
-    if available:
-        return True, available, "OK"
+    if working:
+        return True, all_available, "OK"
     return False, [], last_error or "Ни одна модель Gemini не ответила 200 OK"
 
 
@@ -1962,8 +1971,7 @@ def monitor_status_text() -> str:
     total_info = f"макс. {max_total} шт." if max_total > 0 else "выкл"
 
     if ai_on and has_ai_key:
-        key_type = "Vertex Express" if active_key.startswith("AQ.") else "AI Studio"
-        ai_status = f"✅ ВКЛ ({cur_model} • {key_type})"
+        ai_status = f"✅ ВКЛ ({cur_model})"
     elif ai_on and not has_ai_key:
         ai_status = "⚠️ ВКЛ, но не задан GEMINI_API_KEY"
     else:
@@ -2878,10 +2886,9 @@ async def monitor_set_gemini_input(message: Message, state: FSMContext):
     await state.clear()
 
     models_list_text = "\n".join(f"• <code>{escape_text(m)}</code>" for m in models[:10])
-    key_kind = "Vertex AI Express (AQ.)" if val.startswith("AQ.") else "Google AI Studio (AIza)"
 
     await status_msg.edit_text(
-        f"✅ <b>Ключ принят ({key_kind})!</b>\n\n"
+        f"✅ <b>Ключ Google AI Studio принят!</b>\n\n"
         f"🤖 Подключена модель: <b>{escape_text(chosen_model)}</b>\n"
         f"📋 Доступные модели по этому ключу ({len(models)} шт.):\n{models_list_text}\n\n"
         "<i>Переключить модель можно кнопкой «🤖 МОДЕЛЬ ИИ» в меню мониторинга.</i>",
@@ -2921,7 +2928,7 @@ async def monitor_choose_gemini_model_callback(callback: CallbackQuery):
     await callback.message.edit_text(
         "🤖 <b>ВЫБОР МОДЕЛИ GOOGLE GEMINI</b>\n\n"
         "Нажми на любую доступную модель из списка ниже:\n"
-        "<i>(Рекомендуется <code>gemini-2.5-flash</code> или <code>gemini-2.5-flash-lite</code> — они самые быстрые)</i>",
+        "<i>(Рекомендуются версии <code>flash</code> — они отвечают быстрее всего и имеют наибольшие бесплатные лимиты)</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
@@ -3381,7 +3388,7 @@ async def main():
     trial_watcher_task = asyncio.create_task(trial_watcher_loop())
     accounts_watcher_task = asyncio.create_task(accounts_watcher_loop())
 
-    # Если ключ Gemini уже задан, но список моделей ещё не проверялся — проверяем при старте
+    # Проверяем ключ Gemini при старте и определяем доступные модели
     active_gem_key = get_active_gemini_key()
     if active_gem_key and not MONITOR_SETTINGS.get("gemini_available_models"):
         ok, models, err = await discover_gemini_models_for_key(active_gem_key)
