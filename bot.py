@@ -246,11 +246,6 @@ def get_active_gemini_key() -> str:
 
 
 async def check_owner_with_gemini_ai(owner: "OwnerInfo", gift_title: str, price: int) -> tuple[bool, str]:
-    """
-    Возвращает (is_newbie_target, reason).
-    True = обычный юзер ("бомж"/новичок), отправляем лог.
-    False = перекуп/твинк/шарящий, отбрасываем.
-    """
     global http_session
     if not MONITOR_SETTINGS.get("ai_filter_enabled"):
         return True, "ИИ выключен"
@@ -425,14 +420,18 @@ async def add_account_to_pool(session_str: str, save: bool = True) -> Optional[A
             return existing
 
     client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-    await client.connect()
     try:
+        await client.connect()
         if not await client.is_user_authorized():
             await client.disconnect()
             return None
         me = await client.get_me()
-    except Exception:
-        await client.disconnect()
+    except Exception as e:
+        log.warning("⚠️ Пропуск битой/сдублированной сессии при загрузке (%s)", e.__class__.__name__)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
         return None
 
     for idx, existing in enumerate(list(ACCOUNTS_POOL)):
@@ -1567,7 +1566,6 @@ async def process_monitor_model(base_gift: BaseGift, first_scan: bool) -> int:
                 SENT_GIFTS[slug] = {"skipped": reason, "gift_id": base_gift.gift_id}
                 continue
 
-            # ИИ-фильтр через Google Gemini API (если включён)
             ai_ok, ai_reason = await check_owner_with_gemini_ai(owner, base_gift.title, price)
             if not ai_ok:
                 log.info("🤖 ИИ отсеял %s (%s): %s", slug, owner.display, ai_reason)
@@ -1617,7 +1615,6 @@ async def monitor_cycle(first_scan: bool = False) -> int:
             if active_accs == 0:
                 break
 
-            # Параллельно проверяем столько моделей, сколько активных аккаунтов в пуле (до 5)
             batch_size = min(5, max(1, active_accs))
             batch = models[idx:idx + batch_size]
             idx += batch_size
@@ -2612,7 +2609,7 @@ async def paste_session_input(message: Message, state: FSMContext):
     try:
         worker = await add_account_to_pool(session_str, save=True)
         if not worker:
-            await message.answer("❌ Эта строка сессии не авторизована или уже сброшена в Telegram. Попробуй другую или /cancel.")
+            await message.answer("❌ Эта строка сессии не авторизована, заморожена или сброшена в Telegram. Попробуй другую или /cancel.")
             return
 
         await state.clear()
@@ -3161,6 +3158,7 @@ async def main():
         for item in saved_accounts:
             if isinstance(item, dict) and item.get("session"):
                 await add_account_to_pool(item["session"], save=False)
+        save_accounts_pool()
 
     old_single = await db_get("telethon_session", {})
     if isinstance(old_single, dict) and old_single.get("session"):
