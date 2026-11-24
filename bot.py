@@ -93,7 +93,17 @@ DEFAULT_MAX_PRICE = 0
 DEFAULT_USERNAME_MODE = "required"
 DEFAULT_STRICT_NEWBIE = True     # Отсеивать тех, у кого свой канал или слова скупа/NFT в био
 DEFAULT_NO_PREMIUM = True        # Отсеивать пользователей с Telegram Premium
-DEFAULT_AI_FILTER = True         # ИИ-фильтр через Google Gemini API (работает при наличии ключа)
+DEFAULT_AI_FILTER = True         # ИИ-фильтр через Google Gemini API
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+
+# Кандидаты моделей для проверки доступности по ключу
+GEMINI_CANDIDATE_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+]
 
 TRADER_STOP_WORDS = (
     "nft", "нфт", "gift", "гифт", "подарк", "скуп", "продам", "куплю",
@@ -214,6 +224,8 @@ MONITOR_SETTINGS: Dict[str, Any] = {
     "no_premium_only": DEFAULT_NO_PREMIUM,
     "ai_filter_enabled": DEFAULT_AI_FILTER,
     "gemini_api_key": GEMINI_API_KEY,
+    "gemini_model": DEFAULT_GEMINI_MODEL,
+    "gemini_available_models": [],
 }
 
 monitor_task: Optional[asyncio.Task] = None
@@ -238,11 +250,81 @@ async def notify_admins(text: str) -> None:
 
 
 # ============================================================
-# GOOGLE GEMINI AI FILTER ("АНТИ-СКУП / ПОИСК НЕ ШАРЯЩИХ")
+# GOOGLE GEMINI AI FILTER + АВТООПРЕДЕЛЕНИЕ ДОСТУПНЫХ МОДЕЛЕЙ
 # ============================================================
 
 def get_active_gemini_key() -> str:
     return (MONITOR_SETTINGS.get("gemini_api_key") or GEMINI_API_KEY or "").strip()
+
+
+def get_active_gemini_model() -> str:
+    return (MONITOR_SETTINGS.get("gemini_model") or DEFAULT_GEMINI_MODEL).strip()
+
+
+def build_gemini_generate_url(api_key: str, model_name: str) -> str:
+    clean_model = model_name.replace("models/", "").strip()
+    if api_key.startswith("AQ."):
+        return f"https://aiplatform.googleapis.com/v1/publishers/google/models/{clean_model}:generateContent?key={api_key}"
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={api_key}"
+
+
+async def discover_gemini_models_for_key(api_key: str) -> tuple[bool, List[str], str]:
+    """
+    Проверяет ключ (AIza... или AQ....) и определяет, какие модели Gemini можно подключить.
+    Возвращает: (успех, список_доступных_моделей, текст_ошибки_или_статуса)
+    """
+    global http_session
+    if http_session is None or http_session.closed:
+        connector = aiohttp.TCPConnector(family=socket.AF_INET)
+        http_session = aiohttp.ClientSession(connector=connector)
+
+    available: List[str] = []
+    last_error = ""
+
+    # 1. Для классических AI Studio ключей (AIza...) запрашиваем официальный /v1beta/models
+    if not api_key.startswith("AQ."):
+        list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        try:
+            async with http_session.get(list_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for m in data.get("models") or []:
+                        methods = m.get("supportedGenerationMethods") or []
+                        name = str(m.get("name") or "").replace("models/", "")
+                        if "generateContent" in methods and "gemini" in name.lower():
+                            if not any(bad in name.lower() for bad in ("embedding", "imagen", "veo", "tts", "audio")):
+                                available.append(name)
+                else:
+                    err_data = await resp.text()
+                    last_error = f"HTTP {resp.status}: {err_data[:140]}"
+        except Exception as e:
+            last_error = str(e)
+
+    # 2. Если список пуст или это ключ AQ. (Vertex Express) — пингуем каждую кандидат-модель напрямую
+    if not available:
+        ping_payload = {
+            "contents": [{"parts": [{"text": "Reply OK"}]}],
+            "generationConfig": {"maxOutputTokens": 5, "temperature": 0.0},
+        }
+        for candidate in GEMINI_CANDIDATE_MODELS:
+            url = build_gemini_generate_url(api_key, candidate)
+            try:
+                async with http_session.post(url, json=ping_payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    if resp.status == 200:
+                        available.append(candidate)
+                    else:
+                        err_txt = await resp.text()
+                        last_error = f"HTTP {resp.status}: {err_txt[:140]}"
+            except Exception as e:
+                last_error = str(e)
+
+    # Сортируем так, чтобы приоритетные модели (2.5-flash и 2.5-flash-lite) шли первыми
+    priority = {m: idx for idx, m in enumerate(GEMINI_CANDIDATE_MODELS)}
+    available = sorted(dict.fromkeys(available), key=lambda x: (priority.get(x, 99), x))
+
+    if available:
+        return True, available, "OK"
+    return False, [], last_error or "Ни одна модель Gemini не ответила 200 OK"
 
 
 async def check_owner_with_gemini_ai(owner: "OwnerInfo", gift_title: str, price: int) -> tuple[bool, str]:
@@ -276,7 +358,8 @@ async def check_owner_with_gemini_ai(owner: "OwnerInfo", gift_title: str, price:
         '{"pass": true/false, "reason": "кратко до 6 слов на русском"}'
     )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    model_name = get_active_gemini_model()
+    url = build_gemini_generate_url(api_key, model_name)
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -290,8 +373,8 @@ async def check_owner_with_gemini_ai(owner: "OwnerInfo", gift_title: str, price:
         async with http_session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status != 200:
                 err_txt = await resp.text()
-                log.warning("Gemini API HTTP %s: %s", resp.status, err_txt[:150])
-                return True, "ошибка API (пропущен по умолчанию)"
+                log.warning("Gemini API (%s) HTTP %s: %s", model_name, resp.status, err_txt[:150])
+                return True, "ошибка API (пропущен)"
 
             data = await resp.json()
             candidates = data.get("candidates") or []
@@ -490,7 +573,6 @@ def get_min_flood_wait_remaining() -> int:
 
 
 async def acquire_worker() -> Optional[AccountWorker]:
-    """Берёт следующий активный аккаунт по кругу; аккаунты во FloodWait пропускаются до окончания таймера."""
     global pool_rr_index
     if not ACCOUNTS_POOL:
         return None
@@ -524,7 +606,6 @@ async def acquire_worker() -> Optional[AccountWorker]:
 
 
 async def accounts_watcher_loop() -> None:
-    """Следит за окончанием FloodWait (автоматически возвращает в работу) и проверяет живучесть сессий."""
     last_health_check = 0.0
     while True:
         try:
@@ -793,6 +874,9 @@ def apply_loaded_settings(data: Any) -> None:
 
     db_gemini_key = str(data.get("gemini_api_key", "") or "").strip()
     MONITOR_SETTINGS["gemini_api_key"] = db_gemini_key or GEMINI_API_KEY
+    MONITOR_SETTINGS["gemini_model"] = str(data.get("gemini_model", DEFAULT_GEMINI_MODEL) or DEFAULT_GEMINI_MODEL).strip()
+    avail = data.get("gemini_available_models")
+    MONITOR_SETTINGS["gemini_available_models"] = avail if isinstance(avail, list) else []
 
     username_mode = str(data.get("username_mode", DEFAULT_USERNAME_MODE)).lower()
     MONITOR_SETTINGS["username_mode"] = username_mode if username_mode in {"any", "required"} else "required"
@@ -1644,10 +1728,11 @@ async def monitor_loop() -> None:
     monitor_first_scan_done = False
 
     log.info(
-        "Монитор запущен (акков в пуле: %s, интервал: %s сек, ИИ: %s).",
+        "Монитор запущен (акков в пуле: %s, интервал: %s сек, ИИ: %s [%s]).",
         len(ACCOUNTS_POOL),
         MONITOR_INTERVAL,
         "ВКЛ" if (MONITOR_SETTINGS.get("ai_filter_enabled") and get_active_gemini_key()) else "ВЫКЛ",
+        get_active_gemini_model(),
     )
 
     try:
@@ -1790,6 +1875,7 @@ def monitor_keyboard() -> InlineKeyboardMarkup:
     strict_on = bool(MONITOR_SETTINGS.get("strict_newbie_mode", True))
     no_prem = bool(MONITOR_SETTINGS.get("no_premium_only", True))
     ai_on = bool(MONITOR_SETTINGS.get("ai_filter_enabled", True))
+    cur_model = get_active_gemini_model()
 
     rows = []
     if enabled:
@@ -1827,6 +1913,12 @@ def monitor_keyboard() -> InlineKeyboardMarkup:
             ),
         ],
         [
+            InlineKeyboardButton(
+                text=f"🤖 МОДЕЛЬ ИИ: {cur_model}"[:64],
+                callback_data="monitor_choose_gemini_model",
+            )
+        ],
+        [
             InlineKeyboardButton(text="👤 USERNAME", callback_data="monitor_username"),
             InlineKeyboardButton(text="🎁 МОДЕЛИ", callback_data="monitor_models"),
         ],
@@ -1847,7 +1939,9 @@ def monitor_status_text() -> str:
     strict_on = bool(MONITOR_SETTINGS.get("strict_newbie_mode", True))
     no_prem = bool(MONITOR_SETTINGS.get("no_premium_only", True))
     ai_on = bool(MONITOR_SETTINGS.get("ai_filter_enabled", True))
-    has_ai_key = bool(get_active_gemini_key())
+    active_key = get_active_gemini_key()
+    has_ai_key = bool(active_key)
+    cur_model = get_active_gemini_model()
 
     if min_price and max_price:
         price_text = f"{min_price}—{max_price} ⭐"
@@ -1868,7 +1962,8 @@ def monitor_status_text() -> str:
     total_info = f"макс. {max_total} шт." if max_total > 0 else "выкл"
 
     if ai_on and has_ai_key:
-        ai_status = "✅ ВКЛ (Gemini 2.5 Flash)"
+        key_type = "Vertex Express" if active_key.startswith("AQ.") else "AI Studio"
+        ai_status = f"✅ ВКЛ ({cur_model} • {key_type})"
     elif ai_on and not has_ai_key:
         ai_status = "⚠️ ВКЛ, но не задан GEMINI_API_KEY"
     else:
@@ -2627,7 +2722,7 @@ async def paste_session_input(message: Message, state: FSMContext):
 
 
 # ============================================================
-# АДМИН-МЕНЮ И НАСТРОЙКИ МОНИТОРИНГА (+ УПРАВЛЕНИЕ ИИ)
+# АДМИН-МЕНЮ И НАСТРОЙКИ МОНИТОРИНГА (+ АВТОПОДБОР МОДЕЛЕЙ ИИ)
 # ============================================================
 
 @dp.callback_query(F.data == "menu")
@@ -2726,7 +2821,8 @@ async def monitor_set_gemini_callback(callback: CallbackQuery, state: FSMContext
     await state.set_state(AuthState.waiting_gemini_key)
     await callback.message.answer(
         "🔑 <b>НАСТРОЙКА GOOGLE GEMINI API КЛЮЧА</b>\n\n"
-        "Отправь сюда твой ключ от Google AI Studio (начинается на <code>AIza...</code>).\n"
+        "Отправь сюда твой ключ от Google AI Studio (начинается на <code>AIza...</code> или <code>AQ....</code>).\n"
+        "Бот сам проверит его и покажет, какие модели Gemini можно подключить.\n"
         "Чтобы удалить ключ — отправь <code>0</code>.\n\n"
         "❌ Отмена — /cancel",
         parse_mode="HTML",
@@ -2746,25 +2842,122 @@ async def monitor_set_gemini_input(message: Message, state: FSMContext):
 
     if val == "0":
         MONITOR_SETTINGS["gemini_api_key"] = ""
+        MONITOR_SETTINGS["gemini_available_models"] = []
         MONITOR_SETTINGS["ai_filter_enabled"] = False
         save_monitor_settings()
         await state.clear()
         await message.answer("🗑 Gemini API ключ удалён, ИИ-фильтр выключен.", reply_markup=monitor_keyboard())
         return
 
-    if not val.startswith("AIza") or len(val) < 25:
-        await message.answer("❌ Неверный формат ключа (должен начинаться на <code>AIza...</code>). Попробуй ещё раз или /cancel.", parse_mode="HTML")
+    if not (val.startswith("AIza") or val.startswith("AQ.")) or len(val) < 25:
+        await message.answer(
+            "❌ Неверный формат ключа (должен начинаться на <code>AIza...</code> или <code>AQ....</code>).\n"
+            "Попробуй ещё раз или /cancel.",
+            parse_mode="HTML",
+        )
         return
 
+    status_msg = await message.answer("⏳ Проверяю ключ и определяю доступные модели Gemini...")
+    ok, models, err = await discover_gemini_models_for_key(val)
+
+    if not ok:
+        await status_msg.edit_text(
+            f"❌ <b>Ключ не прошёл проверку!</b>\n"
+            f"Ошибка Google API: <code>{escape_text(err)}</code>\n\n"
+            "Отправь другой ключ или нажми /cancel.",
+            parse_mode="HTML",
+        )
+        return
+
+    chosen_model = models[0]
     MONITOR_SETTINGS["gemini_api_key"] = val
+    MONITOR_SETTINGS["gemini_available_models"] = models
+    MONITOR_SETTINGS["gemini_model"] = chosen_model
     MONITOR_SETTINGS["ai_filter_enabled"] = True
     save_monitor_settings()
     await state.clear()
-    await message.answer(
-        "✅ <b>Google Gemini API ключ сохранён, ИИ-фильтр включён!</b>",
+
+    models_list_text = "\n".join(f"• <code>{escape_text(m)}</code>" for m in models[:10])
+    key_kind = "Vertex AI Express (AQ.)" if val.startswith("AQ.") else "Google AI Studio (AIza)"
+
+    await status_msg.edit_text(
+        f"✅ <b>Ключ принят ({key_kind})!</b>\n\n"
+        f"🤖 Подключена модель: <b>{escape_text(chosen_model)}</b>\n"
+        f"📋 Доступные модели по этому ключу ({len(models)} шт.):\n{models_list_text}\n\n"
+        "<i>Переключить модель можно кнопкой «🤖 МОДЕЛЬ ИИ» в меню мониторинга.</i>",
         parse_mode="HTML",
         reply_markup=monitor_keyboard(),
     )
+
+
+@dp.callback_query(F.data == "monitor_choose_gemini_model")
+async def monitor_choose_gemini_model_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    api_key = get_active_gemini_key()
+    if not api_key:
+        await callback.answer("⚠️ Сначала добавь ключ через «🔑 GEMINI КЛЮЧ»!", show_alert=True)
+        return
+
+    models = MONITOR_SETTINGS.get("gemini_available_models") or []
+    if not models:
+        await callback.answer("Проверяю доступные модели...")
+        ok, models, err = await discover_gemini_models_for_key(api_key)
+        if not ok:
+            await callback.message.answer(f"❌ Не удалось получить список моделей: <code>{escape_text(err)}</code>", parse_mode="HTML")
+            return
+        MONITOR_SETTINGS["gemini_available_models"] = models
+        save_monitor_settings()
+
+    cur_model = get_active_gemini_model()
+    rows = []
+    for m in models[:12]:
+        mark = "✅" if m == cur_model else "⚪️"
+        rows.append([InlineKeyboardButton(text=f"{mark} {m}"[:64], callback_data=f"set_gem_mod:{m}"[:64])])
+    rows.append([InlineKeyboardButton(text="🔄 ПЕРЕПРОВЕРИТЬ КЛЮЧ", callback_data="recheck_gemini_models")])
+    rows.append([InlineKeyboardButton(text="◀️ НАЗАД", callback_data="monitor_menu")])
+
+    await callback.message.edit_text(
+        "🤖 <b>ВЫБОР МОДЕЛИ GOOGLE GEMINI</b>\n\n"
+        "Нажми на любую доступную модель из списка ниже:\n"
+        "<i>(Рекомендуется <code>gemini-2.5-flash</code> или <code>gemini-2.5-flash-lite</code> — они самые быстрые)</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "recheck_gemini_models")
+async def recheck_gemini_models_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    api_key = get_active_gemini_key()
+    if not api_key:
+        await callback.answer("Ключ не задан.", show_alert=True)
+        return
+    await callback.answer("Обновляю список моделей...")
+    ok, models, err = await discover_gemini_models_for_key(api_key)
+    if not ok:
+        await callback.message.answer(f"❌ Ошибка проверки ключа: <code>{escape_text(err)}</code>", parse_mode="HTML")
+        return
+    MONITOR_SETTINGS["gemini_available_models"] = models
+    if get_active_gemini_model() not in models:
+        MONITOR_SETTINGS["gemini_model"] = models[0]
+    save_monitor_settings()
+    await monitor_choose_gemini_model_callback(callback)
+
+
+@dp.callback_query(F.data.startswith("set_gem_mod:"))
+async def set_gem_mod_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    chosen = callback.data.split(":", 1)[1]
+    MONITOR_SETTINGS["gemini_model"] = chosen
+    MONITOR_SETTINGS["ai_filter_enabled"] = True
+    save_monitor_settings()
+    await callback.answer(f"✅ Выбрана модель: {chosen}")
+    await callback.message.edit_text(monitor_status_text(), parse_mode="HTML", reply_markup=monitor_keyboard())
 
 
 @dp.callback_query(F.data == "monitor_username")
@@ -3109,11 +3302,12 @@ async def admin_panel(callback: CallbackQuery):
 
     lifetime_count = sum(1 for u in SUBSCRIPTIONS["users"].values() if u.get("plan") == "lifetime")
     trial_count = sum(1 for u in SUBSCRIPTIONS["users"].values() if u.get("plan") == "trial")
+    ai_ok = MONITOR_SETTINGS.get("ai_filter_enabled") and get_active_gemini_key()
 
     await callback.message.edit_text(
         "⚙️ <b>СТАТИСТИКА И АДМИН-ПАНЕЛЬ</b>\n\n"
         f"👥 Аккаунтов в пуле: <b>{get_active_accounts_count()} активных / {len(ACCOUNTS_POOL)} всего</b>\n"
-        f"🧠 ИИ Gemini: <b>{'✅ ВКЛ' if (MONITOR_SETTINGS.get('ai_filter_enabled') and get_active_gemini_key()) else '❌ ВЫКЛ'}</b>\n"
+        f"🧠 ИИ Gemini: <b>{'✅ ВКЛ (' + get_active_gemini_model() + ')' if ai_ok else '❌ ВЫКЛ'}</b>\n"
         f"🗄 База данных: {'✅ PostgreSQL' if db_pool else '⚠️ Локальная'}\n"
         f"👑 Админов: {len([x for x in ADMIN_IDS if x > 0])}\n"
         f"💎 Подписок навсегда: <b>{lifetime_count}</b> | Триал: <b>{trial_count}</b>\n"
@@ -3186,6 +3380,19 @@ async def main():
     http_session = aiohttp.ClientSession(connector=connector)
     trial_watcher_task = asyncio.create_task(trial_watcher_loop())
     accounts_watcher_task = asyncio.create_task(accounts_watcher_loop())
+
+    # Если ключ Gemini уже задан, но список моделей ещё не проверялся — проверяем при старте
+    active_gem_key = get_active_gemini_key()
+    if active_gem_key and not MONITOR_SETTINGS.get("gemini_available_models"):
+        ok, models, err = await discover_gemini_models_for_key(active_gem_key)
+        if ok:
+            MONITOR_SETTINGS["gemini_available_models"] = models
+            if get_active_gemini_model() not in models:
+                MONITOR_SETTINGS["gemini_model"] = models[0]
+            save_monitor_settings()
+            log.info("✅ Gemini ключ проверен! Доступные модели: %s (активна: %s)", ", ".join(models), get_active_gemini_model())
+        else:
+            log.warning("⚠️ Ключ Gemini не прошёл проверку при старте: %s", err)
 
     log.info(
         "Данные загружены: Аккаунтов в пуле=%s, ЧС=%s, кэш профилей=%s, кэш see.tg=%s, отправлено=%s, моделей=%s",
