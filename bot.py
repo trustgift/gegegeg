@@ -34,6 +34,7 @@ from telethon.errors import (
     FloodWaitError,
     PhoneMigrateError,
     RpcMcgetFailError,
+    RpcCallFailError,
     SessionPasswordNeededError,
     AuthKeyUnregisteredError,
     AuthKeyDuplicatedError,
@@ -69,35 +70,34 @@ SUBSCRIPTION_PRICE_TON = int(os.getenv("SUBSCRIPTION_PRICE_TON", "5"))
 TRIAL_DURATION_SECONDS = 30 * 60  # 30 минут
 MAX_KEY_TRANSFERS = 3             # Максимум переносов подписки по ключу
 
-# Настройки API see.tg (kartoshka.free)
+# Настройки API see.tg (kartoshka.free) — параллельный режим без бутылочного горлышка
 SEETG_TOKEN = os.getenv("SEETG_TOKEN", "").strip()
 SEETG_BASE_URL = "https://kartoshka.free/v1"
-SEETG_REQUEST_DELAY = 0.35
+SEETG_MAX_CONCURRENT = 4          # До 4 одновременных запросов к see.tg
 
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 
-# БЫСТРЫЙ ПАРАЛЛЕЛЬНЫЙ РЕЖИМ (масштабируется от кол-ва аккаунтов в пуле)
-MONITOR_INTERVAL = 4        # Пауза между кругами обхода (сек)
-MONITOR_PAGE_LIMIT = 2      # Проверять 2 самых свежих лота с модели за круг
-PER_ACCOUNT_DELAY = 1.2     # Персональная задержка на каждый аккаунт в пуле (сек)
-MONITOR_SEND_DELAY = 0.2    # Пауза между отправкой сообщений в чат (сек)
-BATCH_STEP_DELAY = 0.25     # Пауза между пачками моделей (сек)
+# МАКСИМАЛЬНАЯ СКОРОСТЬ ПАРСИНГА (МАСШТАБИРУЕТСЯ ОТ КОЛ-ВА АККАУНТОВ)
+MONITOR_INTERVAL = 1.5      # Пауза между кругами обхода (сек)
+MONITOR_PAGE_LIMIT = 5      # Глубина проверки: 5 свежих лотов с каждой модели
+PER_ACCOUNT_DELAY = 0.75    # Персональная задержка на 1 аккаунт (при 5 акках = ~6.6 запр/сек, при 10 акках = ~13 запр/сек)
+MONITOR_SEND_DELAY = 0.1    # Пауза между отправкой сообщений в чат (сек)
+BATCH_STEP_DELAY = 0.05     # Минимальная пауза между пачками моделей (сек)
 
-# ФИЛЬТРЫ ПО УМОЛЧАНИЮ ("НЕ ШАРЯЩИЕ")
-DEFAULT_MAX_NFT_GIFTS = 3        # Максимум 3 NFT-подарка в профиле
-DEFAULT_MAX_TOTAL_GIFTS = 60     # Максимум 60 подарков всего (обычные + NFT)
-DEFAULT_MAX_RATING = 5           # Рейтинг строго < 5
+# СБАЛАНСИРОВАННЫЕ ФИЛЬТРЫ ДЛЯ БОЛЬШОГО ПОТОКА ЛОГОВ (настраиваются кнопками в меню)
+DEFAULT_MAX_NFT_GIFTS = 8        # До 8 NFT-подарков в профиле
+DEFAULT_MAX_TOTAL_GIFTS = 120    # До 120 подарков всего
+DEFAULT_MAX_RATING = 12          # Рейтинг строго < 12
 DEFAULT_MIN_PRICE = 0
 DEFAULT_MAX_PRICE = 0
 DEFAULT_USERNAME_MODE = "required"
-DEFAULT_STRICT_NEWBIE = True     # Отсеивать тех, у кого свой канал или слова скупа/NFT в био
-DEFAULT_NO_PREMIUM = True        # Отсеивать пользователей с Telegram Premium
+DEFAULT_STRICT_NEWBIE = True     # Отсеивать только явных скупов с каналом или словами скупа в био
+DEFAULT_NO_PREMIUM = False       # НЕ резать всех подряд за обычный Premium (можно включить кнопкой)
 
 TRADER_STOP_WORDS = (
-    "nft", "нфт", "gift", "гифт", "подарк", "скуп", "продам", "куплю",
-    "otc", "отс", "гарант", "garant", "ton", "тон", "usdt", "crypto", "крипт",
-    "канал", "t.me/", "http", "shop", "store", "market", "маркет",
-    "trade", "трейд", "p2p", "обмен", "admin", "manager", "менеджер",
+    "скуп", "скупаю", "otc", "отс", "гарант", "garant",
+    "t.me/", "shop", "store", "market", "маркет",
+    "trade", "трейд", "p2p", "обмен", "менеджер",
 )
 
 DEAD_SESSION_ERRORS = (
@@ -192,8 +192,7 @@ SEETG_BILLING: Dict[str, Any] = {
     "balance_ton": 0.0,
 }
 
-seetg_api_lock = asyncio.Lock()
-last_seetg_request = 0.0
+seetg_semaphore = asyncio.Semaphore(SEETG_MAX_CONCURRENT)
 claim_lock = asyncio.Lock()
 subs_lock = asyncio.Lock()
 db_save_tasks: Dict[str, asyncio.Task] = {}
@@ -819,7 +818,7 @@ def owner_passes_target_filters(owner: OwnerInfo) -> tuple[bool, str]:
     max_total = safe_int(MONITOR_SETTINGS.get("max_owner_total_gifts"), 0)
     max_rating = safe_int(MONITOR_SETTINGS.get("max_rating_level"), 0)
     strict_newbie = bool(MONITOR_SETTINGS.get("strict_newbie_mode", True))
-    no_premium = bool(MONITOR_SETTINGS.get("no_premium_only", True))
+    no_premium = bool(MONITOR_SETTINGS.get("no_premium_only", False))
 
     if no_premium and owner.is_premium:
         return False, "есть Telegram Premium"
@@ -936,18 +935,8 @@ async def trial_watcher_loop() -> None:
 
 
 # ============================================================
-# SEE.TG (KARTOSHKA.FREE) RESOLVER
+# SEE.TG (KARTOSHKA.FREE) RESOLVER — ПАРАЛЛЕЛЬНЫЕ ЗАПРОСЫ
 # ============================================================
-
-async def pace_seetg_api() -> None:
-    global last_seetg_request
-    async with seetg_api_lock:
-        now = asyncio.get_running_loop().time()
-        wait_for = SEETG_REQUEST_DELAY - (now - last_seetg_request)
-        if wait_for > 0:
-            await asyncio.sleep(wait_for)
-        last_seetg_request = asyncio.get_running_loop().time()
-
 
 async def fetch_owner_from_seetg(slug: str) -> Dict[str, Any]:
     global http_session
@@ -965,96 +954,96 @@ async def fetch_owner_from_seetg(slug: str) -> Dict[str, Any]:
     }
     url = f"{SEETG_BASE_URL}/gift/{slug}"
 
-    for _ in range(3):
-        await pace_seetg_api()
-        try:
-            async with http_session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
-                free_rem = resp.headers.get("X-Free-Remaining")
-                bal_ton = resp.headers.get("X-Balance")
-                if free_rem is not None:
-                    SEETG_BILLING["free_remaining"] = free_rem
-                if bal_ton is not None:
-                    try:
-                        SEETG_BILLING["balance_ton"] = float(bal_ton)
-                    except ValueError:
-                        pass
+    async with seetg_semaphore:
+        for _ in range(3):
+            try:
+                async with http_session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    free_rem = resp.headers.get("X-Free-Remaining")
+                    bal_ton = resp.headers.get("X-Balance")
+                    if free_rem is not None:
+                        SEETG_BILLING["free_remaining"] = free_rem
+                    if bal_ton is not None:
+                        try:
+                            SEETG_BILLING["balance_ton"] = float(bal_ton)
+                        except ValueError:
+                            pass
 
-                if resp.status == 402:
-                    log.error("SEE.TG: Закончились бесплатные запросы и баланс TON (402)!")
-                    return {"status": "no_balance"}
+                    if resp.status == 402:
+                        log.error("SEE.TG: Закончились бесплатные запросы и баланс TON (402)!")
+                        return {"status": "no_balance"}
 
-                if resp.status == 429:
-                    retry_after = float(resp.headers.get("Retry-After", 1.5))
-                    await asyncio.sleep(retry_after)
-                    continue
+                    if resp.status == 429:
+                        retry_after = float(resp.headers.get("Retry-After", 1.0))
+                        await asyncio.sleep(retry_after)
+                        continue
 
-                if resp.status == 404:
-                    res_data = {"status": "not_found"}
+                    if resp.status == 404:
+                        res_data = {"status": "not_found"}
+                        SEETG_CACHE[slug] = res_data
+                        save_seetg_cache()
+                        return res_data
+
+                    if resp.status != 200:
+                        return {"status": "http_error"}
+
+                    data = await resp.json()
+                    if not data.get("ok"):
+                        return {"status": "api_error"}
+
+                    gift_obj = data.get("result", {}).get("gift") or {}
+                    owner = gift_obj.get("owner") or {}
+
+                    see_type = owner.get("seeType")
+                    tg_type = owner.get("telegramType")
+
+                    if see_type == "blockchain" or tg_type == "blockchain":
+                        res_data = {"status": "blockchain"}
+                        SEETG_CACHE[slug] = res_data
+                        save_seetg_cache()
+                        return res_data
+
+                    if see_type == "hidden" or owner.get("hidden"):
+                        res_data = {"status": "hidden"}
+                        SEETG_CACHE[slug] = res_data
+                        save_seetg_cache()
+                        return res_data
+
+                    if tg_type != "user":
+                        res_data = {"status": f"not_user:{tg_type}"}
+                        SEETG_CACHE[slug] = res_data
+                        save_seetg_cache()
+                        return res_data
+
+                    username = owner.get("username")
+                    if not username:
+                        usernames = owner.get("usernames")
+                        if isinstance(usernames, list) and usernames and isinstance(usernames[0], str):
+                            username = usernames[0]
+                    if isinstance(username, str):
+                        username = username.lstrip("@").strip() or None
+
+                    tg_id_raw = owner.get("telegramId")
+                    tg_id = int(tg_id_raw) if isinstance(tg_id_raw, (int, str)) and str(tg_id_raw).isdigit() else None
+
+                    res_data = {
+                        "status": "ok",
+                        "user_id": tg_id,
+                        "username": username,
+                        "name": owner.get("name"),
+                    }
                     SEETG_CACHE[slug] = res_data
                     save_seetg_cache()
+
+                    log.info(
+                        "SEE.TG [%s] -> @%s (ID: %s) | Free: %s | Bal: %s TON",
+                        slug, username or "нет", tg_id,
+                        SEETG_BILLING["free_remaining"], SEETG_BILLING["balance_ton"]
+                    )
                     return res_data
 
-                if resp.status != 200:
-                    return {"status": "http_error"}
-
-                data = await resp.json()
-                if not data.get("ok"):
-                    return {"status": "api_error"}
-
-                gift_obj = data.get("result", {}).get("gift") or {}
-                owner = gift_obj.get("owner") or {}
-
-                see_type = owner.get("seeType")
-                tg_type = owner.get("telegramType")
-
-                if see_type == "blockchain" or tg_type == "blockchain":
-                    res_data = {"status": "blockchain"}
-                    SEETG_CACHE[slug] = res_data
-                    save_seetg_cache()
-                    return res_data
-
-                if see_type == "hidden" or owner.get("hidden"):
-                    res_data = {"status": "hidden"}
-                    SEETG_CACHE[slug] = res_data
-                    save_seetg_cache()
-                    return res_data
-
-                if tg_type != "user":
-                    res_data = {"status": f"not_user:{tg_type}"}
-                    SEETG_CACHE[slug] = res_data
-                    save_seetg_cache()
-                    return res_data
-
-                username = owner.get("username")
-                if not username:
-                    usernames = owner.get("usernames")
-                    if isinstance(usernames, list) and usernames and isinstance(usernames[0], str):
-                        username = usernames[0]
-                if isinstance(username, str):
-                    username = username.lstrip("@").strip() or None
-
-                tg_id_raw = owner.get("telegramId")
-                tg_id = int(tg_id_raw) if isinstance(tg_id_raw, (int, str)) and str(tg_id_raw).isdigit() else None
-
-                res_data = {
-                    "status": "ok",
-                    "user_id": tg_id,
-                    "username": username,
-                    "name": owner.get("name"),
-                }
-                SEETG_CACHE[slug] = res_data
-                save_seetg_cache()
-
-                log.info(
-                    "SEE.TG [%s] -> @%s (ID: %s) | Free: %s | Bal: %s TON",
-                    slug, username or "нет", tg_id,
-                    SEETG_BILLING["free_remaining"], SEETG_BILLING["balance_ton"]
-                )
-                return res_data
-
-        except Exception as e:
-            log.warning("SEE.TG: Ошибка запроса для %s: %s", slug, e)
-            await asyncio.sleep(1.0)
+            except Exception as e:
+                log.warning("SEE.TG: Ошибка запроса для %s: %s", slug, e)
+                await asyncio.sleep(0.5)
 
     return {"status": "error"}
 
@@ -1336,9 +1325,9 @@ async def get_resale_page(
             set_worker_flood(worker, e.seconds, "GetResaleStarGifts")
         except DEAD_SESSION_ERRORS as e:
             await handle_dead_session(worker, e.__class__.__name__)
-        except RpcMcgetFailError:
-            log.warning("Временный сбой серверов Telegram (RpcMcgetFailError), ждём 2.5 сек...")
-            await asyncio.sleep(2.5)
+        except (RpcMcgetFailError, RpcCallFailError) as e:
+            log.warning("Временный сбой серверов Telegram (%s), ждём 1.5 сек...", e.__class__.__name__)
+            await asyncio.sleep(1.5)
     return None
 
 
@@ -1350,7 +1339,7 @@ def is_stars_only_listing(raw_gift: Any) -> bool:
 
 
 # ============================================================
-# MONITORING LOGIC (ПАРАЛЛЕЛЬНЫЙ ОБХОД + КНОПКА "ЗАБРАТЬ ЛОГ")
+# MONITORING LOGIC (ТУРБО ПАРАЛЛЕЛЬНЫЙ ОБХОД)
 # ============================================================
 
 async def get_monitor_models() -> List[BaseGift]:
@@ -1517,7 +1506,8 @@ async def monitor_cycle(first_scan: bool = False) -> int:
             if active_accs == 0:
                 break
 
-            batch_size = min(5, max(1, active_accs))
+            # Масштабируется до 15 параллельных потоков пропорционально числу живых аккаунтов
+            batch_size = min(15, max(1, active_accs))
             batch = models[idx:idx + batch_size]
             idx += batch_size
 
@@ -1546,12 +1536,10 @@ async def monitor_loop() -> None:
     monitor_first_scan_done = False
 
     log.info(
-        "Монитор запущен (акков в пуле: %s, интервал: %s сек). Рейтинг <%s, Макс. NFT: %s, Макс. всего: %s",
+        "Турбо-монитор запущен (акков в пуле: %s, интервал: %s сек, глубина: %s).",
         len(ACCOUNTS_POOL),
         MONITOR_INTERVAL,
-        MONITOR_SETTINGS.get("max_rating_level"),
-        MONITOR_SETTINGS.get("max_owner_nft_gifts"),
-        MONITOR_SETTINGS.get("max_owner_total_gifts"),
+        MONITOR_PAGE_LIMIT,
     )
 
     try:
@@ -1564,7 +1552,7 @@ async def monitor_loop() -> None:
                 break
 
             if get_active_accounts_count() == 0:
-                await asyncio.sleep(4)
+                await asyncio.sleep(3)
                 continue
 
             await monitor_cycle(first_scan=first_scan)
@@ -1692,7 +1680,7 @@ def user_subscription_keyboard(user_id: int) -> InlineKeyboardMarkup:
 def monitor_keyboard() -> InlineKeyboardMarkup:
     enabled = bool(MONITOR_SETTINGS.get("enabled"))
     strict_on = bool(MONITOR_SETTINGS.get("strict_newbie_mode", True))
-    no_prem = bool(MONITOR_SETTINGS.get("no_premium_only", True))
+    no_prem = bool(MONITOR_SETTINGS.get("no_premium_only", False))
 
     rows = []
     if enabled:
@@ -1738,7 +1726,7 @@ def monitor_status_text() -> str:
     max_nft = safe_int(MONITOR_SETTINGS.get("max_owner_nft_gifts"), 0)
     max_total = safe_int(MONITOR_SETTINGS.get("max_owner_total_gifts"), 0)
     strict_on = bool(MONITOR_SETTINGS.get("strict_newbie_mode", True))
-    no_prem = bool(MONITOR_SETTINGS.get("no_premium_only", True))
+    no_prem = bool(MONITOR_SETTINGS.get("no_premium_only", False))
 
     if min_price and max_price:
         price_text = f"{min_price}—{max_price} ⭐"
@@ -1760,7 +1748,7 @@ def monitor_status_text() -> str:
 
     active_accs = get_active_accounts_count()
     total_accs = len(ACCOUNTS_POOL)
-    parallel_batch = min(5, max(1, active_accs)) if active_accs else 1
+    parallel_batch = min(15, max(1, active_accs)) if active_accs else 1
 
     flood_rem = get_min_flood_wait_remaining()
     flood_line = (
@@ -1771,10 +1759,10 @@ def monitor_status_text() -> str:
     )
 
     return (
-        "📡 <b>АВТОМАТИЧЕСКИЙ МОНИТОРИНГ (ТУРБО + ПУЛ АККОВ)</b>\n\n"
+        "📡 <b>АВТОМАТИЧЕСКИЙ МОНИТОРИНГ (ТУРБО-ПУЛ)</b>\n\n"
         f"Статус: {'🟢 РАБОТАЕТ' if enabled else '🔴 ОСТАНОВЛЕН'}\n"
         f"Аккаунтов в работе: <b>{active_accs} из {total_accs}</b> (потоков: {parallel_batch}x)\n"
-        f"Интервал круга: <b>{MONITOR_INTERVAL} сек.</b> (глубина: {MONITOR_PAGE_LIMIT} лота)\n"
+        f"Интервал круга: <b>{MONITOR_INTERVAL} сек.</b> (глубина: {MONITOR_PAGE_LIMIT} лотов)\n"
         f"Целевая группа: <code>{escape_text(target_text)}</code>\n"
         f"Диапазон цены: <b>{escape_text(price_text)}</b>\n"
         f"Фильтр рейтинга: <b>{escape_text(rating_info)}</b>\n"
@@ -2271,7 +2259,7 @@ def accounts_menu_keyboard() -> InlineKeyboardMarkup:
 def accounts_menu_text() -> str:
     active = get_active_accounts_count()
     total = len(ACCOUNTS_POOL)
-    parallel_batch = min(5, max(1, active)) if active else 1
+    parallel_batch = min(15, max(1, active)) if active else 1
 
     lines = [
         "👥 <b>УПРАВЛЕНИЕ ПУЛОМ АККАУНТОВ TELETHON</b>\n",
@@ -2582,7 +2570,7 @@ async def monitor_toggle_newbie_callback(callback: CallbackQuery):
 async def monitor_toggle_premium_callback(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-    MONITOR_SETTINGS["no_premium_only"] = not bool(MONITOR_SETTINGS.get("no_premium_only", True))
+    MONITOR_SETTINGS["no_premium_only"] = not bool(MONITOR_SETTINGS.get("no_premium_only", False))
     save_monitor_settings()
     await callback.message.edit_text(monitor_status_text(), parse_mode="HTML", reply_markup=monitor_keyboard())
     await callback.answer()
@@ -2642,7 +2630,7 @@ async def monitor_rating_callback(callback: CallbackQuery, state: FSMContext):
     await state.set_state(MonitorRatingState.waiting_rating)
     await callback.message.answer(
         "👑 <b>Настройка фильтра рейтинга Telegram</b>\n\n"
-        "• <code>5</code> — только юзеры с рейтингом <b>строго меньше 5</b>.\n"
+        "• <code>12</code> — только юзеры с рейтингом <b>строго меньше 12</b>.\n"
         "• <code>0</code> — отключить проверку рейтинга.\n\n"
         "❌ Отмена — /cancel",
         parse_mode="HTML"
@@ -2656,7 +2644,7 @@ async def monitor_rating_input(message: Message, state: FSMContext):
         return
     text = (message.text or "").strip()
     if not text.isdigit():
-        await message.answer("❌ Отправь одно целое число (например, <code>5</code> или <code>0</code>).", parse_mode="HTML")
+        await message.answer("❌ Отправь одно целое число (например, <code>12</code> или <code>0</code>).", parse_mode="HTML")
         return
 
     val = int(text)
@@ -2673,7 +2661,7 @@ async def monitor_nft_limit_callback(callback: CallbackQuery, state: FSMContext)
     await state.set_state(MonitorNftLimitState.waiting_limit)
     await callback.message.answer(
         "🖼 <b>Максимум NFT-подарков в профиле</b>\n\n"
-        "• <code>3</code> — пропускать тех, у кого больше 3 NFT-подарков.\n"
+        "• <code>8</code> — пропускать тех, у кого больше 8 NFT-подарков.\n"
         "• <code>0</code> — выключить фильтр.\n\n"
         "❌ Отмена — /cancel",
         parse_mode="HTML"
@@ -2687,7 +2675,7 @@ async def monitor_nft_limit_input(message: Message, state: FSMContext):
         return
     text = (message.text or "").strip()
     if not text.isdigit():
-        await message.answer("❌ Отправь число (например: <code>3</code> или <code>0</code>).", parse_mode="HTML")
+        await message.answer("❌ Отправь число (например: <code>8</code> или <code>0</code>).", parse_mode="HTML")
         return
 
     val = int(text)
@@ -2704,7 +2692,7 @@ async def monitor_total_gifts_callback(callback: CallbackQuery, state: FSMContex
     await state.set_state(MonitorTotalGiftsState.waiting_total_limit)
     await callback.message.answer(
         "📦 <b>Максимум ВСЕХ подарков в профиле</b>\n\n"
-        "• <code>60</code> — пропускать юзеров, у которых всего больше 60 подарков.\n"
+        "• <code>120</code> — пропускать юзеров, у которых всего больше 120 подарков.\n"
         "• <code>0</code> — выключить фильтр.\n\n"
         "❌ Отмена — /cancel",
         parse_mode="HTML"
@@ -2718,7 +2706,7 @@ async def monitor_total_gifts_input(message: Message, state: FSMContext):
         return
     text = (message.text or "").strip()
     if not text.isdigit():
-        await message.answer("❌ Отправь число (например: <code>60</code> или <code>0</code>).", parse_mode="HTML")
+        await message.answer("❌ Отправь число (например: <code>120</code> или <code>0</code>).", parse_mode="HTML")
         return
 
     val = int(text)
