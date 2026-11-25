@@ -57,10 +57,6 @@ API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELETHON_SESSION = os.getenv("TELETHON_SESSION", "").strip()
 
-# Поддержка OpenAI-совместимого API (codex.sale/v1)
-AI_BASE_URL = os.getenv("AI_BASE_URL", "https://codex.sale/v1").strip().rstrip("/")
-AI_API_KEY = (os.getenv("AI_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
-
 ADMIN_IDS: Set[int] = {
     int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 }
@@ -96,18 +92,6 @@ DEFAULT_MAX_PRICE = 0
 DEFAULT_USERNAME_MODE = "required"
 DEFAULT_STRICT_NEWBIE = True     # Отсеивать тех, у кого свой канал или слова скупа/NFT в био
 DEFAULT_NO_PREMIUM = True        # Отсеивать пользователей с Telegram Premium
-DEFAULT_AI_FILTER = True         # ИИ-фильтр продавцов
-DEFAULT_AI_MODEL = "claude-haiku-4-5-20251001"
-
-AI_CANDIDATE_MODELS = [
-    "claude-haiku-4-5-20251001",
-    "gpt-5.6-luna",
-    "gpt-5.6-sol",
-    "gpt-4o-mini",
-    "gpt-4.1-mini",
-    "deepseek-v4.1-flash-abliterated",
-    "glm-5.3-flash-abliterated",
-]
 
 TRADER_STOP_WORDS = (
     "nft", "нфт", "gift", "гифт", "подарк", "скуп", "продам", "куплю",
@@ -210,7 +194,6 @@ SEETG_BILLING: Dict[str, Any] = {
 
 seetg_api_lock = asyncio.Lock()
 last_seetg_request = 0.0
-last_ai_alert_ts = 0.0
 claim_lock = asyncio.Lock()
 subs_lock = asyncio.Lock()
 db_save_tasks: Dict[str, asyncio.Task] = {}
@@ -227,11 +210,6 @@ MONITOR_SETTINGS: Dict[str, Any] = {
     "max_rating_level": DEFAULT_MAX_RATING,
     "strict_newbie_mode": DEFAULT_STRICT_NEWBIE,
     "no_premium_only": DEFAULT_NO_PREMIUM,
-    "ai_filter_enabled": DEFAULT_AI_FILTER,
-    "ai_base_url": AI_BASE_URL,
-    "ai_api_key": AI_API_KEY,
-    "ai_model": DEFAULT_AI_MODEL,
-    "ai_available_models": [],
 }
 
 monitor_task: Optional[asyncio.Task] = None
@@ -253,269 +231,6 @@ async def notify_admins(text: str) -> None:
                 await bot.send_message(admin_id, text, parse_mode="HTML", disable_web_page_preview=True)
             except Exception as e:
                 log.warning("Не удалось отправить уведомление админу %s: %s", admin_id, e)
-
-
-# ============================================================
-# OPENAI-COMPATIBLE AI FILTER (ПРОВЕРКА ВСЕХ МОДЕЛЕЙ + ПУЛ РАБОЧИХ)
-# ============================================================
-
-def get_active_ai_base_url() -> str:
-    return (MONITOR_SETTINGS.get("ai_base_url") or AI_BASE_URL or "https://codex.sale/v1").strip().rstrip("/")
-
-
-def get_active_ai_key() -> str:
-    return (MONITOR_SETTINGS.get("ai_api_key") or AI_API_KEY or "").strip()
-
-
-def get_active_ai_model() -> str:
-    return (MONITOR_SETTINGS.get("ai_model") or DEFAULT_AI_MODEL).strip()
-
-
-def parse_ai_json_response(raw_text: str) -> Optional[Dict[str, Any]]:
-    if not raw_text:
-        return None
-    text = raw_text.strip()
-    if "</think>" in text:
-        text = text.split("</think>", 1)[1].strip()
-    text = text.replace("```json", "").replace("```", "").strip()
-    start_idx = text.find("{")
-    end_idx = text.rfind("}")
-    if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
-        return None
-    try:
-        obj = json.loads(text[start_idx:end_idx + 1])
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
-
-
-async def _test_single_ai_model(url_root: str, headers: Dict[str, str], model_id: str) -> tuple[str, bool, float, str]:
-    """Проверяет одну модель реальным JSON-ответом. Возвращает (model_id, is_working, latency_sec, error)."""
-    global http_session
-    ping_payload = {
-        "model": model_id,
-        "messages": [{"role": "user", "content": 'Ответь строго JSON: {"ok": true}'}],
-        "max_tokens": 120,
-        "temperature": 0.0,
-    }
-    t0 = time.monotonic()
-    try:
-        async with http_session.post(
-            f"{url_root}/chat/completions",
-            headers=headers,
-            json=ping_payload,
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            latency = round(time.monotonic() - t0, 2)
-            if resp.status != 200:
-                err_txt = await resp.text()
-                return model_id, False, latency, f"HTTP {resp.status}: {err_txt[:120]}"
-
-            data = await resp.json()
-            choices = data.get("choices") or []
-            if not choices:
-                return model_id, False, latency, "Пустой choices"
-
-            content = (choices[0].get("message", {}).get("content") or "").strip()
-            parsed = parse_ai_json_response(content)
-            if parsed is None:
-                return model_id, False, latency, f"Невалидный JSON: {content[:80]}"
-
-            return model_id, True, latency, "OK"
-    except Exception as e:
-        return model_id, False, round(time.monotonic() - t0, 2), str(e)
-
-
-async def discover_ai_models_for_key(api_key: str, base_url: Optional[str] = None) -> tuple[bool, List[str], str]:
-    """
-    1. Запрашивает все модели из /v1/models.
-    2. Проверяет КАЖДУЮ текстовую модель реальным JSON-запросом (пачками по 5 штук).
-    3. Возвращает ТОЛЬКО реально рабочие модели, отсортированные по скорости ответа.
-    """
-    global http_session
-    if http_session is None or http_session.closed:
-        connector = aiohttp.TCPConnector(family=socket.AF_INET)
-        http_session = aiohttp.ClientSession(connector=connector)
-
-    url_root = (base_url or get_active_ai_base_url()).rstrip("/")
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    fetched_models: List[str] = []
-    last_error = ""
-
-    try:
-        async with http_session.get(f"{url_root}/models", headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                for m in data.get("data") or []:
-                    mid = str(m.get("id") or "").strip()
-                    low = mid.lower()
-                    if not mid:
-                        continue
-                    if any(bad in low for bad in (
-                        "embedding", "dall-e", "whisper", "tts", "audio", "transcribe",
-                        "realtime", "moderation", "sora", "imagen", "veo", "flux", "midjourney"
-                    )):
-                        continue
-                    fetched_models.append(mid)
-            else:
-                err_data = await resp.text()
-                last_error = f"HTTP {resp.status}: {err_data[:180]}"
-    except Exception as e:
-        last_error = str(e)
-
-    candidates = list(dict.fromkeys(fetched_models)) or AI_CANDIDATE_MODELS
-    working_with_speed: List[tuple[float, str]] = []
-
-    # Проверяем ВСЕ модели пачками по 5 одновременно
-    for idx in range(0, len(candidates), 5):
-        batch = candidates[idx:idx + 5]
-        results = await asyncio.gather(*(_test_single_ai_model(url_root, headers, m) for m in batch))
-        for model_id, is_ok, latency, err_msg in results:
-            if is_ok:
-                working_with_speed.append((latency, model_id))
-                log.info("✅ ИИ-модель прошла проверку: %s (%.2f сек)", model_id, latency)
-            else:
-                last_error = f"{model_id} -> {err_msg}"
-                log.info("❌ ИИ-модель не прошла проверку: %s (%s)", model_id, err_msg)
-
-    # Сортируем рабочие модели от самой быстрой к самой медленной
-    working_with_speed.sort(key=lambda item: item[0])
-    working_models = [m for _, m in working_with_speed]
-
-    if working_models:
-        return True, working_models, "OK"
-    return False, [], last_error or "Ни одна модель не прошла проверку"
-
-
-async def check_owner_with_ai(owner: "OwnerInfo", gift_title: str, price: int) -> tuple[bool, str]:
-    global http_session, last_ai_alert_ts
-    if not MONITOR_SETTINGS.get("ai_filter_enabled"):
-        return True, "ИИ выключен"
-
-    api_key = get_active_ai_key()
-    if not api_key:
-        return True, "нет API ключа ИИ"
-
-    working_pool = MONITOR_SETTINGS.get("ai_available_models") or []
-    if not working_pool:
-        ok, models, err = await discover_ai_models_for_key(api_key)
-        if ok:
-            working_pool = models
-            MONITOR_SETTINGS["ai_available_models"] = models
-            MONITOR_SETTINGS["ai_model"] = models[0]
-            save_monitor_settings()
-        else:
-            now = time.time()
-            if now - last_ai_alert_ts > 900:
-                last_ai_alert_ts = now
-                asyncio.create_task(
-                    notify_admins(
-                        "🚨 <b>ВСЕ ИИ-МОДЕЛИ НЕ РАБОТАЮТ!</b>\n\n"
-                        f"Сервер: <code>{escape_text(get_active_ai_base_url())}</code>\n"
-                        f"Ошибка: <code>{escape_text(err)}</code>\n\n"
-                        "Проверь баланс/ключ в меню 📡 МОНИТОРИНГ → 🔑 API КЛЮЧ ИИ."
-                    )
-                )
-            return True, "все ИИ недоступны"
-
-    if http_session is None or http_session.closed:
-        connector = aiohttp.TCPConnector(family=socket.AF_INET)
-        http_session = aiohttp.ClientSession(connector=connector)
-
-    prompt = (
-        "Ты антифрод-аналитик Telegram NFT маркета. Определи, является ли продавец обычным простым пользователем "
-        "(«новичком» / «не шарящим», который случайно или по незнанию выставил подарок), ИЛИ это скрытый перекуп, "
-        "трейдер, твинк скупа, крипто-юзер или опытный коллекционер.\n\n"
-        f"Данные продавца:\n"
-        f"- Имя: {owner.label}\n"
-        f"- Username: @{owner.username or 'нет'}\n"
-        f"- Био (О себе): {owner.bio or 'пусто'}\n"
-        f"- Рейтинг звёзд: {owner.rating_level}\n"
-        f"- Всего подарков: {owner.total_gifts_count} (из них NFT: {owner.nft_gifts_count})\n"
-        f"- Telegram Premium: {'да' if owner.is_premium else 'нет'}\n"
-        f"- Выставил подарок: {gift_title} за {price} Stars\n\n"
-        "Признаки перекупа/твинка: сленг крипты/NFT/трейдинга, ссылки, шаблонные никнеймы ферм/авторегов, "
-        "слишком много подарков или завышенный рейтинг.\n"
-        "Ответь СТРОГО одним JSON-объектом без markdown и пояснений: "
-        '{"pass": true/false, "reason": "кратко до 6 слов на русском"}'
-    )
-
-    url_root = get_active_ai_base_url()
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    primary = get_active_ai_model()
-    models_to_try = list(dict.fromkeys(([primary] if primary in working_pool else []) + working_pool))
-    last_err = ""
-
-    for model_name in models_to_try:
-        payload = {
-            "model": model_name,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.1,
-            "max_tokens": 250,
-        }
-        try:
-            async with http_session.post(
-                f"{url_root}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status != 200:
-                    err_txt = await resp.text()
-                    last_err = f"HTTP {resp.status}: {err_txt[:120]}"
-                    log.warning("AI API (%s) %s", model_name, last_err)
-                    continue
-
-                data = await resp.json()
-                choices = data.get("choices") or []
-                if not choices:
-                    last_err = "Пустой choices"
-                    continue
-
-                raw_text = (choices[0].get("message", {}).get("content") or "").strip()
-                parsed = parse_ai_json_response(raw_text)
-                if parsed is None:
-                    last_err = f"Ответ без JSON: {raw_text[:80]}"
-                    log.warning("AI (%s) %s", model_name, last_err)
-                    continue
-
-                passed = bool(parsed.get("pass", True))
-                reason = str(parsed.get("reason") or "оценка ИИ").strip()
-
-                if model_name != primary:
-                    MONITOR_SETTINGS["ai_model"] = model_name
-                    save_monitor_settings()
-                    log.info("🔄 Автопереключение ИИ на рабочую модель: %s", model_name)
-
-                return passed, reason
-
-        except Exception as e:
-            last_err = str(e)
-            log.warning("AI check fallback [%s] (%s)", model_name, e)
-            continue
-
-    # Если НИ ОДНА модель из всего пула рабочих не ответила — уведомляем админов
-    now = time.time()
-    if now - last_ai_alert_ts > 900:
-        last_ai_alert_ts = now
-        asyncio.create_task(
-            notify_admins(
-                "🚨 <b>ВНИМАНИЕ: ВСЕ РАБОЧИЕ МОДЕЛИ ИИ ОТКАЗАЛИ!</b>\n\n"
-                f"Перебраны все модели ({len(models_to_try)} шт.), но ни одна не ответила.\n"
-                f"❌ Последняя ошибка: <code>{escape_text(last_err)}</code>\n\n"
-                "Парсер продолжает работу без ИИ-фильтра. Проверь ключ или нажми «🔄 ПЕРЕПРОВЕРИТЬ ВСЕ МОДЕЛИ» в меню ИИ."
-            )
-        )
-
-    return True, "все ИИ временно недоступны"
 
 
 # ============================================================
@@ -817,7 +532,6 @@ class AuthState(StatesGroup):
     waiting_code = State()
     waiting_password = State()
     waiting_string_session = State()
-    waiting_ai_key = State()
 
 
 class MonitorPriceState(StatesGroup):
@@ -989,19 +703,6 @@ def apply_loaded_settings(data: Any) -> None:
     MONITOR_SETTINGS["max_rating_level"] = max(0, int(data.get("max_rating_level", DEFAULT_MAX_RATING) or 0))
     MONITOR_SETTINGS["strict_newbie_mode"] = bool(data.get("strict_newbie_mode", DEFAULT_STRICT_NEWBIE))
     MONITOR_SETTINGS["no_premium_only"] = bool(data.get("no_premium_only", DEFAULT_NO_PREMIUM))
-    MONITOR_SETTINGS["ai_filter_enabled"] = bool(data.get("ai_filter_enabled", DEFAULT_AI_FILTER))
-
-    db_base_url = str(data.get("ai_base_url", "") or "").strip().rstrip("/")
-    MONITOR_SETTINGS["ai_base_url"] = db_base_url or AI_BASE_URL
-
-    db_ai_key = str(data.get("ai_api_key") or data.get("gemini_api_key") or "").strip()
-    MONITOR_SETTINGS["ai_api_key"] = db_ai_key or AI_API_KEY
-
-    db_ai_model = str(data.get("ai_model") or data.get("gemini_model") or DEFAULT_AI_MODEL).strip()
-    MONITOR_SETTINGS["ai_model"] = db_ai_model
-
-    avail = data.get("ai_available_models")
-    MONITOR_SETTINGS["ai_available_models"] = avail if isinstance(avail, list) else []
 
     username_mode = str(data.get("username_mode", DEFAULT_USERNAME_MODE)).lower()
     MONITOR_SETTINGS["username_mode"] = username_mode if username_mode in {"any", "required"} else "required"
@@ -1649,7 +1350,7 @@ def is_stars_only_listing(raw_gift: Any) -> bool:
 
 
 # ============================================================
-# MONITORING LOGIC (ПАРАЛЛЕЛЬНЫЙ ОБХОД + ИИ-ПРОВЕРКА)
+# MONITORING LOGIC (ПАРАЛЛЕЛЬНЫЙ ОБХОД + КНОПКА "ЗАБРАТЬ ЛОГ")
 # ============================================================
 
 async def get_monitor_models() -> List[BaseGift]:
@@ -1660,7 +1361,7 @@ async def get_monitor_models() -> List[BaseGift]:
     return [g for g in BASE_GIFTS if g.gift_id in selected and g.availability_resale > 0]
 
 
-async def send_monitor_gift(market_gift: MarketGift, base_gift: BaseGift, ai_note: str = "") -> bool:
+async def send_monitor_gift(market_gift: MarketGift, base_gift: BaseGift) -> bool:
     target_chat_id = get_target_chat_id()
     if not target_chat_id:
         return False
@@ -1670,7 +1371,6 @@ async def send_monitor_gift(market_gift: MarketGift, base_gift: BaseGift, ai_not
     rating_display = str(owner.rating_level) if owner.rating_level > 0 else "0 / новичок"
     profile_line = f"{owner.nft_gifts_count} NFT (всего: {owner.total_gifts_count} шт.)"
     prem_tag = "без Premium" if not owner.is_premium else "с Premium"
-    ai_block = f"🧠 <b>Вердикт ИИ:</b> {escape_text(ai_note)}\n" if ai_note and MONITOR_SETTINGS.get("ai_filter_enabled") and get_active_ai_key() else ""
 
     public_text = (
         "🚨 <b>НОВЫЙ ЛОГ (STARS)</b>\n\n"
@@ -1678,8 +1378,7 @@ async def send_monitor_gift(market_gift: MarketGift, base_gift: BaseGift, ai_not
         f"📦 <b>Модель:</b> {escape_text(base_gift.title)}\n"
         f"💰 <b>Цена:</b> {market_gift.price} ⭐\n"
         f"👑 <b>Рейтинг владельца:</b> {rating_display}\n"
-        f"🖼 <b>Профиль:</b> {profile_line} • {prem_tag}\n"
-        f"{ai_block}\n"
+        f"🖼 <b>Профиль:</b> {profile_line} • {prem_tag}\n\n"
         "👇 Нажми кнопку ниже, чтобы забрать контакт себе в ЛС:"
     )
 
@@ -1775,12 +1474,6 @@ async def process_monitor_model(base_gift: BaseGift, first_scan: bool) -> int:
                 SENT_GIFTS[slug] = {"skipped": reason, "gift_id": base_gift.gift_id}
                 continue
 
-            ai_ok, ai_reason = await check_owner_with_ai(owner, base_gift.title, price)
-            if not ai_ok:
-                log.info("🤖 ИИ отсеял %s (%s): %s", slug, owner.display, ai_reason)
-                SENT_GIFTS[slug] = {"skipped": f"AI: {ai_reason}", "gift_id": base_gift.gift_id}
-                continue
-
             market_gift = MarketGift(
                 title=str(get_field(raw, "title") or base_gift.title),
                 num=safe_int(get_field(raw, "num")),
@@ -1796,7 +1489,7 @@ async def process_monitor_model(base_gift: BaseGift, first_scan: bool) -> int:
                 "gift_id": base_gift.gift_id,
             }
 
-            sent = await send_monitor_gift(market_gift, base_gift, ai_note=ai_reason)
+            sent = await send_monitor_gift(market_gift, base_gift)
             if sent:
                 await asyncio.sleep(MONITOR_SEND_DELAY)
                 sent_count += 1
@@ -1852,14 +1545,13 @@ async def monitor_loop() -> None:
     monitor_running = True
     monitor_first_scan_done = False
 
-    working_cnt = len(MONITOR_SETTINGS.get("ai_available_models") or [])
     log.info(
-        "Монитор запущен (акков в пуле: %s, интервал: %s сек, ИИ: %s [%s | рабочих моделей: %s]).",
+        "Монитор запущен (акков в пуле: %s, интервал: %s сек). Рейтинг <%s, Макс. NFT: %s, Макс. всего: %s",
         len(ACCOUNTS_POOL),
         MONITOR_INTERVAL,
-        "ВКЛ" if (MONITOR_SETTINGS.get("ai_filter_enabled") and get_active_ai_key()) else "ВЫКЛ",
-        get_active_ai_model(),
-        working_cnt,
+        MONITOR_SETTINGS.get("max_rating_level"),
+        MONITOR_SETTINGS.get("max_owner_nft_gifts"),
+        MONITOR_SETTINGS.get("max_owner_total_gifts"),
     )
 
     try:
@@ -1892,21 +1584,6 @@ async def start_monitor() -> bool:
     global monitor_task
     if not get_target_chat_id() or not ACCOUNTS_POOL:
         return False
-
-    # Перед запуском убеждаемся, что ИИ-модели проверены, если ключ задан
-    active_key = get_active_ai_key()
-    if MONITOR_SETTINGS.get("ai_filter_enabled") and active_key and not MONITOR_SETTINGS.get("ai_available_models"):
-        ok, models, err = await discover_ai_models_for_key(active_key)
-        if ok:
-            MONITOR_SETTINGS["ai_available_models"] = models
-            MONITOR_SETTINGS["ai_model"] = models[0]
-            save_monitor_settings()
-        else:
-            await notify_admins(
-                "🚨 <b>ИИ-фильтр не смог найти рабочие модели при запуске!</b>\n\n"
-                f"Ошибка: <code>{escape_text(err)}</code>\n"
-                "Парсер запущен, но без ИИ-проверки."
-            )
 
     MONITOR_SETTINGS["enabled"] = True
     save_monitor_settings()
@@ -2016,9 +1693,6 @@ def monitor_keyboard() -> InlineKeyboardMarkup:
     enabled = bool(MONITOR_SETTINGS.get("enabled"))
     strict_on = bool(MONITOR_SETTINGS.get("strict_newbie_mode", True))
     no_prem = bool(MONITOR_SETTINGS.get("no_premium_only", True))
-    ai_on = bool(MONITOR_SETTINGS.get("ai_filter_enabled", True))
-    cur_model = get_active_ai_model()
-    working_cnt = len(MONITOR_SETTINGS.get("ai_available_models") or [])
 
     rows = []
     if enabled:
@@ -2046,22 +1720,6 @@ def monitor_keyboard() -> InlineKeyboardMarkup:
             ),
         ],
         [
-            InlineKeyboardButton(
-                text=f"🧠 ИИ-ФИЛЬТР: {'ВКЛ' if ai_on else 'ВЫКЛ'}",
-                callback_data="monitor_toggle_ai",
-            ),
-            InlineKeyboardButton(
-                text="🔑 API КЛЮЧ ИИ",
-                callback_data="monitor_set_ai_key",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text=f"🤖 МОДЕЛЬ ИИ ({working_cnt} раб.): {cur_model}"[:64],
-                callback_data="monitor_choose_ai_model",
-            )
-        ],
-        [
             InlineKeyboardButton(text="👤 USERNAME", callback_data="monitor_username"),
             InlineKeyboardButton(text="🎁 МОДЕЛИ", callback_data="monitor_models"),
         ],
@@ -2081,11 +1739,6 @@ def monitor_status_text() -> str:
     max_total = safe_int(MONITOR_SETTINGS.get("max_owner_total_gifts"), 0)
     strict_on = bool(MONITOR_SETTINGS.get("strict_newbie_mode", True))
     no_prem = bool(MONITOR_SETTINGS.get("no_premium_only", True))
-    ai_on = bool(MONITOR_SETTINGS.get("ai_filter_enabled", True))
-    active_key = get_active_ai_key()
-    has_ai_key = bool(active_key)
-    cur_model = get_active_ai_model()
-    working_cnt = len(MONITOR_SETTINGS.get("ai_available_models") or [])
 
     if min_price and max_price:
         price_text = f"{min_price}—{max_price} ⭐"
@@ -2105,15 +1758,6 @@ def monitor_status_text() -> str:
     nft_info = f"макс. {max_nft} шт." if max_nft > 0 else "выкл"
     total_info = f"макс. {max_total} шт." if max_total > 0 else "выкл"
 
-    if ai_on and has_ai_key and working_cnt > 0:
-        ai_status = f"✅ ВКЛ ({cur_model} | пул: {working_cnt} раб.)"
-    elif ai_on and has_ai_key and working_cnt == 0:
-        ai_status = "⚠️ ВКЛ, но 0 рабочих моделей"
-    elif ai_on and not has_ai_key:
-        ai_status = "⚠️ ВКЛ, но не задан API ключ"
-    else:
-        ai_status = "❌ ВЫКЛ"
-
     active_accs = get_active_accounts_count()
     total_accs = len(ACCOUNTS_POOL)
     parallel_batch = min(5, max(1, active_accs)) if active_accs else 1
@@ -2127,7 +1771,7 @@ def monitor_status_text() -> str:
     )
 
     return (
-        "📡 <b>АВТОМАТИЧЕСКИЙ МОНИТОРИНГ (ТУРБО + ИИ)</b>\n\n"
+        "📡 <b>АВТОМАТИЧЕСКИЙ МОНИТОРИНГ (ТУРБО + ПУЛ АККОВ)</b>\n\n"
         f"Статус: {'🟢 РАБОТАЕТ' if enabled else '🔴 ОСТАНОВЛЕН'}\n"
         f"Аккаунтов в работе: <b>{active_accs} из {total_accs}</b> (потоков: {parallel_batch}x)\n"
         f"Интервал круга: <b>{MONITOR_INTERVAL} сек.</b> (глубина: {MONITOR_PAGE_LIMIT} лота)\n"
@@ -2135,9 +1779,8 @@ def monitor_status_text() -> str:
         f"Диапазон цены: <b>{escape_text(price_text)}</b>\n"
         f"Фильтр рейтинга: <b>{escape_text(rating_info)}</b>\n"
         f"NFT / Всего подарков: <b>{escape_text(nft_info)} / {escape_text(total_info)}</b>\n"
-        f"Режим «Не шарящие»: <b>{'✅ ВКЛ' if strict_on else '❌ ВЫКЛ'}</b>\n"
+        f"Режим «Не шарящие»: <b>{'✅ ВКЛ (без каналов и био скупов)' if strict_on else '❌ ВЫКЛ'}</b>\n"
         f"Фильтр Premium: <b>{'✅ только без Premium' if no_prem else 'любые'}</b>\n"
-        f"ИИ-фильтр ({escape_text(get_active_ai_base_url())}): <b>{ai_status}</b>\n"
         f"Юзернейм: <b>{escape_text(username_text)}</b>\n"
         f"Модели: <b>{escape_text(model_text)}</b>\n"
         f"See.tg: Free <b>{SEETG_BILLING['free_remaining']}</b> | Баланс <b>{SEETG_BILLING['balance_ton']} TON</b>\n"
@@ -2867,7 +2510,7 @@ async def paste_session_input(message: Message, state: FSMContext):
 
 
 # ============================================================
-# АДМИН-МЕНЮ И НАСТРОЙКИ МОНИТОРИНГА (+ АВТОПОДБОР МОДЕЛЕЙ ИИ)
+# АДМИН-МЕНЮ И НАСТРОЙКИ МОНИТОРИНГА
 # ============================================================
 
 @dp.callback_query(F.data == "menu")
@@ -2943,168 +2586,6 @@ async def monitor_toggle_premium_callback(callback: CallbackQuery):
     save_monitor_settings()
     await callback.message.edit_text(monitor_status_text(), parse_mode="HTML", reply_markup=monitor_keyboard())
     await callback.answer()
-
-
-@dp.callback_query(F.data == "monitor_toggle_ai")
-async def monitor_toggle_ai_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    new_state = not bool(MONITOR_SETTINGS.get("ai_filter_enabled", True))
-    if new_state and not get_active_ai_key():
-        await callback.answer("⚠️ Сначала задай ключ через кнопку «🔑 API КЛЮЧ ИИ»!", show_alert=True)
-        return
-    MONITOR_SETTINGS["ai_filter_enabled"] = new_state
-    save_monitor_settings()
-    await callback.message.edit_text(monitor_status_text(), parse_mode="HTML", reply_markup=monitor_keyboard())
-    await callback.answer(f"🧠 ИИ-фильтр {'включён' if new_state else 'выключен'}.")
-
-
-@dp.callback_query(F.data == "monitor_set_ai_key")
-async def monitor_set_ai_key_callback(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await state.set_state(AuthState.waiting_ai_key)
-    await callback.message.answer(
-        "🔑 <b>НАСТРОЙКА API КЛЮЧА ИИ</b>\n\n"
-        f"Текущий сервер: <code>{escape_text(get_active_ai_base_url())}</code>\n"
-        "Отправь сюда твой ключ (начинается на <code>sk-...</code>).\n"
-        "Бот протестирует <b>все</b> модели на аккаунте и оставит только реально рабочие.\n"
-        "Чтобы удалить ключ — отправь <code>0</code>.\n\n"
-        "❌ Отмена — /cancel",
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-@dp.message(AuthState.waiting_ai_key)
-async def monitor_set_ai_key_input(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    val = (message.text or "").strip()
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-    if val == "0":
-        MONITOR_SETTINGS["ai_api_key"] = ""
-        MONITOR_SETTINGS["ai_available_models"] = []
-        MONITOR_SETTINGS["ai_filter_enabled"] = False
-        save_monitor_settings()
-        await state.clear()
-        await message.answer("🗑 API ключ ИИ удалён, ИИ-фильтр выключен.", reply_markup=monitor_keyboard())
-        return
-
-    if len(val) < 15 or " " in val:
-        await message.answer(
-            "❌ Неверный формат ключа (слишком короткий или содержит пробелы).\n"
-            "Отправь ключ формата <code>sk-...</code> или /cancel.",
-            parse_mode="HTML",
-        )
-        return
-
-    status_msg = await message.answer("⏳ Тестирую все модели по ключу и отбираю рабочие (займёт 3–5 сек)...")
-    ok, models, err = await discover_ai_models_for_key(val)
-
-    if not ok:
-        await status_msg.edit_text(
-            f"❌ <b>Ни одна модель не прошла проверку!</b>\n"
-            f"Ошибка API: <code>{escape_text(err)}</code>\n\n"
-            "Отправь другой ключ или нажми /cancel.",
-            parse_mode="HTML",
-        )
-        return
-
-    chosen_model = models[0]
-    MONITOR_SETTINGS["ai_api_key"] = val
-    MONITOR_SETTINGS["ai_available_models"] = models
-    MONITOR_SETTINGS["ai_model"] = chosen_model
-    MONITOR_SETTINGS["ai_filter_enabled"] = True
-    save_monitor_settings()
-    await state.clear()
-
-    models_list_text = "\n".join(f"• <code>{escape_text(m)}</code>" for m in models[:15])
-
-    await status_msg.edit_text(
-        f"✅ <b>API ключ принят ({escape_text(get_active_ai_base_url())})!</b>\n\n"
-        f"🤖 Основная модель: <b>{escape_text(chosen_model)}</b>\n"
-        f"📋 Найдено рабочих моделей: <b>{len(models)} шт.</b> (бот будет автоматически переключаться между ними при перегрузке):\n"
-        f"{models_list_text}",
-        parse_mode="HTML",
-        reply_markup=monitor_keyboard(),
-    )
-
-
-@dp.callback_query(F.data == "monitor_choose_ai_model")
-async def monitor_choose_ai_model_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-
-    api_key = get_active_ai_key()
-    if not api_key:
-        await callback.answer("⚠️ Сначала добавь ключ через «🔑 API КЛЮЧ ИИ»!", show_alert=True)
-        return
-
-    models = MONITOR_SETTINGS.get("ai_available_models") or []
-    if not models:
-        await callback.answer("Тестирую все модели...")
-        ok, models, err = await discover_ai_models_for_key(api_key)
-        if not ok:
-            await callback.message.answer(f"❌ Ни одна модель не прошла проверку: <code>{escape_text(err)}</code>", parse_mode="HTML")
-            return
-        MONITOR_SETTINGS["ai_available_models"] = models
-        save_monitor_settings()
-
-    cur_model = get_active_ai_model()
-    rows = []
-    for m in models[:14]:
-        mark = "✅" if m == cur_model else "⚪️"
-        rows.append([InlineKeyboardButton(text=f"{mark} {m}"[:64], callback_data=f"set_ai_mod:{m}"[:64])])
-    rows.append([InlineKeyboardButton(text="🔄 ПЕРЕПРОВЕРИТЬ ВСЕ МОДЕЛИ", callback_data="recheck_ai_models")])
-    rows.append([InlineKeyboardButton(text="◀️ НАЗАД", callback_data="monitor_menu")])
-
-    await callback.message.edit_text(
-        f"🤖 <b>РАБОЧИЕ МОДЕЛИ ИИ ({len(models)} ШТ.)</b>\n\n"
-        "В списке показаны только модели, успешно прошедшие JSON-тест.\n"
-        "При отказе основной модели бот сам переключится на следующую рабочую из этого списка:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "recheck_ai_models")
-async def recheck_ai_models_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    api_key = get_active_ai_key()
-    if not api_key:
-        await callback.answer("Ключ не задан.", show_alert=True)
-        return
-    await callback.answer("Тестирую все модели...")
-    ok, models, err = await discover_ai_models_for_key(api_key)
-    if not ok:
-        MONITOR_SETTINGS["ai_available_models"] = []
-        save_monitor_settings()
-        await callback.message.answer(f"❌ Ни одна модель не прошла проверку: <code>{escape_text(err)}</code>", parse_mode="HTML")
-        return
-    MONITOR_SETTINGS["ai_available_models"] = models
-    if get_active_ai_model() not in models:
-        MONITOR_SETTINGS["ai_model"] = models[0]
-    save_monitor_settings()
-    await monitor_choose_ai_model_callback(callback)
-
-
-@dp.callback_query(F.data.startswith("set_ai_mod:"))
-async def set_ai_mod_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    chosen = callback.data.split(":", 1)[1]
-    MONITOR_SETTINGS["ai_model"] = chosen
-    MONITOR_SETTINGS["ai_filter_enabled"] = True
-    save_monitor_settings()
-    await callback.answer(f"✅ Выбрана основная модель: {chosen}")
-    await callback.message.edit_text(monitor_status_text(), parse_mode="HTML", reply_markup=monitor_keyboard())
 
 
 @dp.callback_query(F.data == "monitor_username")
@@ -3449,13 +2930,10 @@ async def admin_panel(callback: CallbackQuery):
 
     lifetime_count = sum(1 for u in SUBSCRIPTIONS["users"].values() if u.get("plan") == "lifetime")
     trial_count = sum(1 for u in SUBSCRIPTIONS["users"].values() if u.get("plan") == "trial")
-    working_cnt = len(MONITOR_SETTINGS.get("ai_available_models") or [])
-    ai_ok = MONITOR_SETTINGS.get("ai_filter_enabled") and get_active_ai_key() and working_cnt > 0
 
     await callback.message.edit_text(
         "⚙️ <b>СТАТИСТИКА И АДМИН-ПАНЕЛЬ</b>\n\n"
         f"👥 Аккаунтов в пуле: <b>{get_active_accounts_count()} активных / {len(ACCOUNTS_POOL)} всего</b>\n"
-        f"🧠 ИИ-фильтр: <b>{'✅ ВКЛ (' + get_active_ai_model() + f' • {working_cnt} раб.)' if ai_ok else '❌ ВЫКЛ'}</b>\n"
         f"🗄 База данных: {'✅ PostgreSQL' if db_pool else '⚠️ Локальная'}\n"
         f"👑 Админов: {len([x for x in ADMIN_IDS if x > 0])}\n"
         f"💎 Подписок навсегда: <b>{lifetime_count}</b> | Триал: <b>{trial_count}</b>\n"
@@ -3528,27 +3006,6 @@ async def main():
     http_session = aiohttp.ClientSession(connector=connector)
     trial_watcher_task = asyncio.create_task(trial_watcher_loop())
     accounts_watcher_task = asyncio.create_task(accounts_watcher_loop())
-
-    # При старте проверяем ВСЕ модели по ключу и оставляем только рабочие
-    active_ai_key = get_active_ai_key()
-    if active_ai_key:
-        ok, models, err = await discover_ai_models_for_key(active_ai_key)
-        if ok:
-            MONITOR_SETTINGS["ai_available_models"] = models
-            if get_active_ai_model() not in models:
-                MONITOR_SETTINGS["ai_model"] = models[0]
-            save_monitor_settings()
-            log.info("✅ AI проверен! Рабочие модели (%s шт.): %s (активна: %s)", len(models), ", ".join(models), get_active_ai_model())
-        else:
-            MONITOR_SETTINGS["ai_available_models"] = []
-            save_monitor_settings()
-            log.warning("⚠️ При старте не найдено ни одной рабочей модели ИИ: %s", err)
-            await notify_admins(
-                "🚨 <b>ВНИМАНИЕ: ПРИ ЗАПУСКЕ БОТА НЕ НАЙДЕНО РАБОЧИХ МОДЕЛЕЙ ИИ!</b>\n\n"
-                f"Сервер: <code>{escape_text(get_active_ai_base_url())}</code>\n"
-                f"Ошибка: <code>{escape_text(err)}</code>\n\n"
-                "Проверь ключ в меню 📡 МОНИТОРИНГ → 🔑 API КЛЮЧ ИИ."
-            )
 
     log.info(
         "Данные загружены: Аккаунтов в пуле=%s, ЧС=%s, кэш профилей=%s, кэш see.tg=%s, отправлено=%s, моделей=%s",
