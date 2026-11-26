@@ -38,6 +38,7 @@ from telethon.errors import (
     SessionPasswordNeededError,
     AuthKeyUnregisteredError,
     AuthKeyDuplicatedError,
+    SessionRevokedError,
     FrozenMethodInvalidError,
     UserDeactivatedBanError,
     UserDeactivatedError,
@@ -70,29 +71,29 @@ SUBSCRIPTION_PRICE_TON = int(os.getenv("SUBSCRIPTION_PRICE_TON", "5"))
 TRIAL_DURATION_SECONDS = 30 * 60  # 30 минут
 MAX_KEY_TRANSFERS = 3             # Максимум переносов подписки по ключу
 
-# Настройки API see.tg (kartoshka.free) — параллельный режим без бутылочного горлышка
+# Настройки API see.tg (kartoshka.free) — параллельный режим без очереди
 SEETG_TOKEN = os.getenv("SEETG_TOKEN", "").strip()
 SEETG_BASE_URL = "https://kartoshka.free/v1"
-SEETG_MAX_CONCURRENT = 4          # До 4 одновременных запросов к see.tg
+SEETG_MAX_CONCURRENT = 6          # До 6 одновременных запросов к see.tg
 
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 
-# МАКСИМАЛЬНАЯ СКОРОСТЬ ПАРСИНГА (МАСШТАБИРУЕТСЯ ОТ КОЛ-ВА АККАУНТОВ)
-MONITOR_INTERVAL = 1.5      # Пауза между кругами обхода (сек)
-MONITOR_PAGE_LIMIT = 5      # Глубина проверки: 5 свежих лотов с каждой модели
-PER_ACCOUNT_DELAY = 0.75    # Персональная задержка на 1 аккаунт (при 5 акках = ~6.6 запр/сек, при 10 акках = ~13 запр/сек)
-MONITOR_SEND_DELAY = 0.1    # Пауза между отправкой сообщений в чат (сек)
-BATCH_STEP_DELAY = 0.05     # Минимальная пауза между пачками моделей (сек)
+# ТУРБО-РЕЖИМ ПАРСИНГА (МАСШТАБИРУЕТСЯ ОТ КОЛ-ВА АККАУНТОВ)
+MONITOR_INTERVAL = 1.0      # Пауза между кругами обхода (сек)
+MONITOR_PAGE_LIMIT = 10     # Глубина проверки: 10 свежих лотов с каждой модели
+PER_ACCOUNT_DELAY = 0.55    # Персональная задержка на 1 аккаунт (при 5 акках = ~9 запр/сек, при 10 акках = ~18 запр/сек)
+MONITOR_SEND_DELAY = 0.08   # Пауза между отправкой сообщений в чат (сек)
+BATCH_STEP_DELAY = 0.02     # Минимальная пауза между пачками моделей (сек)
 
-# СБАЛАНСИРОВАННЫЕ ФИЛЬТРЫ ДЛЯ БОЛЬШОГО ПОТОКА ЛОГОВ (настраиваются кнопками в меню)
-DEFAULT_MAX_NFT_GIFTS = 8        # До 8 NFT-подарков в профиле
-DEFAULT_MAX_TOTAL_GIFTS = 120    # До 120 подарков всего
-DEFAULT_MAX_RATING = 12          # Рейтинг строго < 12
+# ШИРОКИЕ ФИЛЬТРЫ ДЛЯ МАКСИМАЛЬНОГО ПОТОКА ЛОГОВ (настраиваются кнопками в меню)
+DEFAULT_MAX_NFT_GIFTS = 12       # До 12 NFT-подарков в профиле
+DEFAULT_MAX_TOTAL_GIFTS = 150    # До 150 подарков всего
+DEFAULT_MAX_RATING = 15          # Рейтинг строго < 15
 DEFAULT_MIN_PRICE = 0
 DEFAULT_MAX_PRICE = 0
 DEFAULT_USERNAME_MODE = "required"
 DEFAULT_STRICT_NEWBIE = True     # Отсеивать только явных скупов с каналом или словами скупа в био
-DEFAULT_NO_PREMIUM = False       # НЕ резать всех подряд за обычный Premium (можно включить кнопкой)
+DEFAULT_NO_PREMIUM = False       # Пропускать юзеров с Premium (чтобы не резать 70% обычных продавцов)
 
 TRADER_STOP_WORDS = (
     "скуп", "скупаю", "otc", "отс", "гарант", "garant",
@@ -103,6 +104,7 @@ TRADER_STOP_WORDS = (
 DEAD_SESSION_ERRORS = (
     AuthKeyUnregisteredError,
     AuthKeyDuplicatedError,
+    SessionRevokedError,
     FrozenMethodInvalidError,
     UserDeactivatedBanError,
     UserDeactivatedError,
@@ -198,6 +200,7 @@ subs_lock = asyncio.Lock()
 db_save_tasks: Dict[str, asyncio.Task] = {}
 
 MONITOR_SETTINGS: Dict[str, Any] = {
+    "settings_v": 2,
     "enabled": False,
     "target_chat_id": TARGET_CHAT_ID,
     "min_price": DEFAULT_MIN_PRICE,
@@ -307,6 +310,7 @@ async def handle_dead_session(worker: AccountWorker, reason: str) -> None:
         pass
 
     human_reason = {
+        "SessionRevokedError": "Сессия сброшена / разлогинена (SESSION_REVOKED)",
         "FrozenMethodInvalidError": "Аккаунт заморожен Telegram (Frozen)",
         "AuthKeyDuplicatedError": "Сессия использовалась с двух IP одновременно (AuthKeyDuplicated)",
         "AuthKeyUnregisteredError": "Сессия разлогинена (AuthKeyUnregistered)",
@@ -335,7 +339,13 @@ async def add_account_to_pool(session_str: str, save: bool = True) -> Optional[A
         if existing.session_str == session_str:
             return existing
 
-    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    # receive_updates=False отключает фоновый спам Cannot get difference и экономит трафик
+    client = TelegramClient(
+        StringSession(session_str),
+        API_ID,
+        API_HASH,
+        receive_updates=False,
+    )
     try:
         await client.connect()
         if not await client.is_user_authorized():
@@ -458,14 +468,14 @@ async def accounts_watcher_loop() -> None:
                         f"📊 Активных в пуле: <b>{active_now} из {total}</b>"
                     )
 
-            if now - last_health_check >= 120:
+            if now - last_health_check >= 60:
                 last_health_check = now
                 for w in list(ACCOUNTS_POOL):
                     try:
                         if not w.client.is_connected():
                             await w.client.connect()
                         if not await w.client.is_user_authorized():
-                            await handle_dead_session(w, "AuthKeyUnregisteredError")
+                            await handle_dead_session(w, "SessionRevokedError")
                     except DEAD_SESSION_ERRORS as e:
                         await handle_dead_session(w, e.__class__.__name__)
                     except Exception as e:
@@ -697,11 +707,23 @@ def apply_loaded_settings(data: Any) -> None:
     MONITOR_SETTINGS["target_chat_id"] = int(data.get("target_chat_id", TARGET_CHAT_ID) or TARGET_CHAT_ID or 0)
     MONITOR_SETTINGS["min_price"] = max(0, int(data.get("min_price", DEFAULT_MIN_PRICE) or 0))
     MONITOR_SETTINGS["max_price"] = max(0, int(data.get("max_price", DEFAULT_MAX_PRICE) or 0))
-    MONITOR_SETTINGS["max_owner_nft_gifts"] = max(0, int(data.get("max_owner_nft_gifts", DEFAULT_MAX_NFT_GIFTS) or 0))
-    MONITOR_SETTINGS["max_owner_total_gifts"] = max(0, int(data.get("max_owner_total_gifts", DEFAULT_MAX_TOTAL_GIFTS) or 0))
-    MONITOR_SETTINGS["max_rating_level"] = max(0, int(data.get("max_rating_level", DEFAULT_MAX_RATING) or 0))
-    MONITOR_SETTINGS["strict_newbie_mode"] = bool(data.get("strict_newbie_mode", DEFAULT_STRICT_NEWBIE))
-    MONITOR_SETTINGS["no_premium_only"] = bool(data.get("no_premium_only", DEFAULT_NO_PREMIUM))
+
+    # Авто-миграция со старых жёстких лимитов (v1 -> v2) для широкого потока логов
+    if safe_int(data.get("settings_v"), 1) < 2:
+        MONITOR_SETTINGS["settings_v"] = 2
+        MONITOR_SETTINGS["max_owner_nft_gifts"] = DEFAULT_MAX_NFT_GIFTS
+        MONITOR_SETTINGS["max_owner_total_gifts"] = DEFAULT_MAX_TOTAL_GIFTS
+        MONITOR_SETTINGS["max_rating_level"] = DEFAULT_MAX_RATING
+        MONITOR_SETTINGS["strict_newbie_mode"] = DEFAULT_STRICT_NEWBIE
+        MONITOR_SETTINGS["no_premium_only"] = DEFAULT_NO_PREMIUM
+        save_monitor_settings()
+    else:
+        MONITOR_SETTINGS["settings_v"] = 2
+        MONITOR_SETTINGS["max_owner_nft_gifts"] = max(0, int(data.get("max_owner_nft_gifts", DEFAULT_MAX_NFT_GIFTS) or 0))
+        MONITOR_SETTINGS["max_owner_total_gifts"] = max(0, int(data.get("max_owner_total_gifts", DEFAULT_MAX_TOTAL_GIFTS) or 0))
+        MONITOR_SETTINGS["max_rating_level"] = max(0, int(data.get("max_rating_level", DEFAULT_MAX_RATING) or 0))
+        MONITOR_SETTINGS["strict_newbie_mode"] = bool(data.get("strict_newbie_mode", DEFAULT_STRICT_NEWBIE))
+        MONITOR_SETTINGS["no_premium_only"] = bool(data.get("no_premium_only", DEFAULT_NO_PREMIUM))
 
     username_mode = str(data.get("username_mode", DEFAULT_USERNAME_MODE)).lower()
     MONITOR_SETTINGS["username_mode"] = username_mode if username_mode in {"any", "required"} else "required"
@@ -1070,7 +1092,7 @@ def is_nft_gift(obj: Any) -> bool:
     return False
 
 
-async def fetch_user_nft_gifts_count(worker: AccountWorker, peer: Any, user_id: int, max_to_check: int = 10) -> int:
+async def fetch_user_nft_gifts_count(worker: AccountWorker, peer: Any, user_id: int, max_to_check: int = 15) -> int:
     try:
         async with worker.lock:
             if not worker.client.is_connected():
@@ -1098,7 +1120,7 @@ async def fetch_user_nft_gifts_count(worker: AccountWorker, peer: Any, user_id: 
                         functions.payments.GetSavedStarGiftsRequest(
                             peer=peer,
                             offset="",
-                            limit=30,
+                            limit=35,
                         )
                     )
                     raw_gifts = getattr(res, "gifts", []) or []
@@ -1107,7 +1129,7 @@ async def fetch_user_nft_gifts_count(worker: AccountWorker, peer: Any, user_id: 
                     functions.payments.GetUserStarGiftsRequest(
                         user_id=peer,
                         offset="",
-                        limit=30,
+                        limit=35,
                     )
                 )
                 raw_gifts = getattr(res, "gifts", []) or []
@@ -2346,7 +2368,7 @@ async def auth_phone(message: Message, state: FSMContext):
         if pending_auth_client and pending_auth_client.is_connected():
             await pending_auth_client.disconnect()
 
-        pending_auth_client = TelegramClient(StringSession(), API_ID, API_HASH)
+        pending_auth_client = TelegramClient(StringSession(), API_ID, API_HASH, receive_updates=False)
         await pending_auth_client.connect()
 
         try:
@@ -2630,7 +2652,7 @@ async def monitor_rating_callback(callback: CallbackQuery, state: FSMContext):
     await state.set_state(MonitorRatingState.waiting_rating)
     await callback.message.answer(
         "👑 <b>Настройка фильтра рейтинга Telegram</b>\n\n"
-        "• <code>12</code> — только юзеры с рейтингом <b>строго меньше 12</b>.\n"
+        "• <code>15</code> — только юзеры с рейтингом <b>строго меньше 15</b>.\n"
         "• <code>0</code> — отключить проверку рейтинга.\n\n"
         "❌ Отмена — /cancel",
         parse_mode="HTML"
@@ -2644,7 +2666,7 @@ async def monitor_rating_input(message: Message, state: FSMContext):
         return
     text = (message.text or "").strip()
     if not text.isdigit():
-        await message.answer("❌ Отправь одно целое число (например, <code>12</code> или <code>0</code>).", parse_mode="HTML")
+        await message.answer("❌ Отправь одно целое число (например, <code>15</code> или <code>0</code>).", parse_mode="HTML")
         return
 
     val = int(text)
@@ -2661,7 +2683,7 @@ async def monitor_nft_limit_callback(callback: CallbackQuery, state: FSMContext)
     await state.set_state(MonitorNftLimitState.waiting_limit)
     await callback.message.answer(
         "🖼 <b>Максимум NFT-подарков в профиле</b>\n\n"
-        "• <code>8</code> — пропускать тех, у кого больше 8 NFT-подарков.\n"
+        "• <code>12</code> — пропускать тех, у кого больше 12 NFT-подарков.\n"
         "• <code>0</code> — выключить фильтр.\n\n"
         "❌ Отмена — /cancel",
         parse_mode="HTML"
@@ -2675,7 +2697,7 @@ async def monitor_nft_limit_input(message: Message, state: FSMContext):
         return
     text = (message.text or "").strip()
     if not text.isdigit():
-        await message.answer("❌ Отправь число (например: <code>8</code> или <code>0</code>).", parse_mode="HTML")
+        await message.answer("❌ Отправь число (например: <code>12</code> или <code>0</code>).", parse_mode="HTML")
         return
 
     val = int(text)
@@ -2692,7 +2714,7 @@ async def monitor_total_gifts_callback(callback: CallbackQuery, state: FSMContex
     await state.set_state(MonitorTotalGiftsState.waiting_total_limit)
     await callback.message.answer(
         "📦 <b>Максимум ВСЕХ подарков в профиле</b>\n\n"
-        "• <code>120</code> — пропускать юзеров, у которых всего больше 120 подарков.\n"
+        "• <code>150</code> — пропускать юзеров, у которых всего больше 150 подарков.\n"
         "• <code>0</code> — выключить фильтр.\n\n"
         "❌ Отмена — /cancel",
         parse_mode="HTML"
@@ -2706,7 +2728,7 @@ async def monitor_total_gifts_input(message: Message, state: FSMContext):
         return
     text = (message.text or "").strip()
     if not text.isdigit():
-        await message.answer("❌ Отправь число (например: <code>120</code> или <code>0</code>).", parse_mode="HTML")
+        await message.answer("❌ Отправь число (например: <code>150</code> или <code>0</code>).", parse_mode="HTML")
         return
 
     val = int(text)
