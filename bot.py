@@ -81,7 +81,7 @@ TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 # ТУРБО-РЕЖИМ ПАРСИНГА (МАСШТАБИРУЕТСЯ ОТ КОЛ-ВА АККАУНТОВ)
 MONITOR_INTERVAL = 2.0      # Пауза между кругами обхода (сек)
 MONITOR_PAGE_LIMIT = 10     # Глубина проверки: 10 свежих лотов с каждой модели
-PER_ACCOUNT_DELAY = 0.95    # Персональная задержка на 1 аккаунт (при 5 акках = ~9 запр/сек, при 10 акках = ~18 запр/сек)
+PER_ACCOUNT_DELAY = 0.95    # Безопасная персональная задержка на 1 аккаунт (сек)
 MONITOR_SEND_DELAY = 0.08   # Пауза между отправкой сообщений в чат (сек)
 BATCH_STEP_DELAY = 0.02     # Минимальная пауза между пачками моделей (сек)
 
@@ -93,7 +93,7 @@ DEFAULT_MIN_PRICE = 0
 DEFAULT_MAX_PRICE = 0
 DEFAULT_USERNAME_MODE = "required"
 DEFAULT_STRICT_NEWBIE = True     # Отсеивать только явных скупов с каналом или словами скупа в био
-DEFAULT_NO_PREMIUM = False       # Пропускать юзеров с Premium (чтобы не резать 70% обычных продавцов)
+DEFAULT_NO_PREMIUM = False       # Пропускать юзеров с Premium
 
 TRADER_STOP_WORDS = (
     "скуп", "скупаю", "otc", "отс", "гарант", "garant",
@@ -278,7 +278,7 @@ def set_worker_flood(worker: AccountWorker, seconds: int, context_name: str = "A
     already_in_flood = time.time() < worker.flood_until
     worker.flood_until = max(worker.flood_until, time.time() + wait_time)
 
-   if (not already_in_flood or not worker.flood_notified) and wait_time > 60:
+    if (not already_in_flood or not worker.flood_notified) and wait_time > 60:
         worker.flood_notified = True
         mins = max(1, round(wait_time / 60))
         active_left = get_active_accounts_count()
@@ -339,8 +339,8 @@ async def add_account_to_pool(session_str: str, save: bool = True) -> Optional[A
         if existing.session_str == session_str:
             return existing
 
-    # receive_updates=False отключает фоновый спам Cannot get difference и экономит трафик
-   client = TelegramClient(
+    # flood_sleep_threshold=0 не блокирует поток при коротком флуде — воркер сразу уступает место свободному аккичу
+    client = TelegramClient(
         StringSession(session_str),
         API_ID,
         API_HASH,
@@ -709,7 +709,6 @@ def apply_loaded_settings(data: Any) -> None:
     MONITOR_SETTINGS["min_price"] = max(0, int(data.get("min_price", DEFAULT_MIN_PRICE) or 0))
     MONITOR_SETTINGS["max_price"] = max(0, int(data.get("max_price", DEFAULT_MAX_PRICE) or 0))
 
-    # Авто-миграция со старых жёстких лимитов (v1 -> v2) для широкого потока логов
     if safe_int(data.get("settings_v"), 1) < 2:
         MONITOR_SETTINGS["settings_v"] = 2
         MONITOR_SETTINGS["max_owner_nft_gifts"] = DEFAULT_MAX_NFT_GIFTS
@@ -1529,7 +1528,6 @@ async def monitor_cycle(first_scan: bool = False) -> int:
             if active_accs == 0:
                 break
 
-            # Масштабируется до 15 параллельных потоков пропорционально числу живых аккаунтов
             batch_size = min(15, max(1, active_accs))
             batch = models[idx:idx + batch_size]
             idx += batch_size
@@ -2369,7 +2367,13 @@ async def auth_phone(message: Message, state: FSMContext):
         if pending_auth_client and pending_auth_client.is_connected():
             await pending_auth_client.disconnect()
 
-        pending_auth_client = TelegramClient(StringSession(), API_ID, API_HASH, receive_updates=False)
+        pending_auth_client = TelegramClient(
+            StringSession(),
+            API_ID,
+            API_HASH,
+            receive_updates=False,
+            flood_sleep_threshold=0,
+        )
         await pending_auth_client.connect()
 
         try:
