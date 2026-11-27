@@ -79,9 +79,9 @@ SEETG_MAX_CONCURRENT = 6          # До 6 одновременных запро
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 
 # ТУРБО-РЕЖИМ ПАРСИНГА (МАСШТАБИРУЕТСЯ ОТ КОЛ-ВА АККАУНТОВ)
-MONITOR_INTERVAL = 1.0      # Пауза между кругами обхода (сек)
+MONITOR_INTERVAL = 2.0      # Пауза между кругами обхода (сек)
 MONITOR_PAGE_LIMIT = 10     # Глубина проверки: 10 свежих лотов с каждой модели
-PER_ACCOUNT_DELAY = 0.55    # Персональная задержка на 1 аккаунт (при 5 акках = ~9 запр/сек, при 10 акках = ~18 запр/сек)
+PER_ACCOUNT_DELAY = 0.95    # Персональная задержка на 1 аккаунт (при 5 акках = ~9 запр/сек, при 10 акках = ~18 запр/сек)
 MONITOR_SEND_DELAY = 0.08   # Пауза между отправкой сообщений в чат (сек)
 BATCH_STEP_DELAY = 0.02     # Минимальная пауза между пачками моделей (сек)
 
@@ -278,7 +278,7 @@ def set_worker_flood(worker: AccountWorker, seconds: int, context_name: str = "A
     already_in_flood = time.time() < worker.flood_until
     worker.flood_until = max(worker.flood_until, time.time() + wait_time)
 
-    if not already_in_flood or not worker.flood_notified:
+   if (not already_in_flood or not worker.flood_notified) and wait_time > 60:
         worker.flood_notified = True
         mins = max(1, round(wait_time / 60))
         active_left = get_active_accounts_count()
@@ -340,11 +340,12 @@ async def add_account_to_pool(session_str: str, save: bool = True) -> Optional[A
             return existing
 
     # receive_updates=False отключает фоновый спам Cannot get difference и экономит трафик
-    client = TelegramClient(
+   client = TelegramClient(
         StringSession(session_str),
         API_ID,
         API_HASH,
         receive_updates=False,
+        flood_sleep_threshold=0,
     )
     try:
         await client.connect()
