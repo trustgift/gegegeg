@@ -71,29 +71,29 @@ SUBSCRIPTION_PRICE_TON = int(os.getenv("SUBSCRIPTION_PRICE_TON", "5"))
 TRIAL_DURATION_SECONDS = 30 * 60  # 30 минут
 MAX_KEY_TRANSFERS = 3             # Максимум переносов подписки по ключу
 
-# Настройки API see.tg (kartoshka.free) — параллельный режим без очереди
+# Настройки API see.tg (kartoshka.free)
 SEETG_TOKEN = os.getenv("SEETG_TOKEN", "").strip()
 SEETG_BASE_URL = "https://kartoshka.free/v1"
-SEETG_MAX_CONCURRENT = 6          # До 6 одновременных запросов к see.tg
+SEETG_MAX_CONCURRENT = 6
 
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 
-# ТУРБО-РЕЖИМ ПАРСИНГА (МАСШТАБИРУЕТСЯ ОТ КОЛ-ВА АККАУНТОВ)
-MONITOR_INTERVAL = 2.0      # Пауза между кругами обхода (сек)
-MONITOR_PAGE_LIMIT = 10     # Глубина проверки: 10 свежих лотов с каждой модели
-PER_ACCOUNT_DELAY = 0.95    # Безопасная персональная задержка на 1 аккаунт (сек)
-MONITOR_SEND_DELAY = 0.08   # Пауза между отправкой сообщений в чат (сек)
-BATCH_STEP_DELAY = 0.02     # Минимальная пауза между пачками моделей (сек)
+# ТУРБО-РЕЖИМ ПАРСИНГА
+MONITOR_INTERVAL = 2.0
+MONITOR_PAGE_LIMIT = 10
+PER_ACCOUNT_DELAY = 0.95
+MONITOR_SEND_DELAY = 0.08
+BATCH_STEP_DELAY = 0.02
 
-# ШИРОКИЕ ФИЛЬТРЫ ДЛЯ МАКСИМАЛЬНОГО ПОТОКА ЛОГОВ (настраиваются кнопками в меню)
-DEFAULT_MAX_NFT_GIFTS = 12       # До 12 NFT-подарков в профиле
-DEFAULT_MAX_TOTAL_GIFTS = 150    # До 150 подарков всего
-DEFAULT_MAX_RATING = 15          # Рейтинг строго < 15
+# ШИРОКИЕ ФИЛЬТРЫ ДЛЯ МАКСИМАЛЬНОГО ПОТОКА ЛОГОВ
+DEFAULT_MAX_NFT_GIFTS = 12
+DEFAULT_MAX_TOTAL_GIFTS = 150
+DEFAULT_MAX_RATING = 15
 DEFAULT_MIN_PRICE = 0
 DEFAULT_MAX_PRICE = 0
 DEFAULT_USERNAME_MODE = "required"
-DEFAULT_STRICT_NEWBIE = True     # Отсеивать только явных скупов с каналом или словами скупа в био
-DEFAULT_NO_PREMIUM = False       # Пропускать юзеров с Premium
+DEFAULT_STRICT_NEWBIE = True
+DEFAULT_NO_PREMIUM = False
 
 TRADER_STOP_WORDS = (
     "скуп", "скупаю", "otc", "отс", "гарант", "garant",
@@ -128,8 +128,6 @@ log = logging.getLogger("gift-parser")
 
 
 class IPv4AiohttpSession(AiohttpSession):
-    """Принудительный IPv4 для Docker-хостингов (исправляет Connection reset by peer)."""
-
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._connector_init["family"] = socket.AF_INET
@@ -236,7 +234,7 @@ async def notify_admins(text: str) -> None:
 
 
 # ============================================================
-# MULTI-ACCOUNT POOL (АВТО-ОТКЛЮЧЕНИЕ, УВЕДОМЛЕНИЯ, ВОЗВРАТ)
+# MULTI-ACCOUNT POOL
 # ============================================================
 
 @dataclass
@@ -339,7 +337,6 @@ async def add_account_to_pool(session_str: str, save: bool = True) -> Optional[A
         if existing.session_str == session_str:
             return existing
 
-    # flood_sleep_threshold=0 не блокирует поток при коротком флуде — воркер сразу уступает место свободному аккичу
     client = TelegramClient(
         StringSession(session_str),
         API_ID,
@@ -957,7 +954,7 @@ async def trial_watcher_loop() -> None:
 
 
 # ============================================================
-# SEE.TG (KARTOSHKA.FREE) RESOLVER — ПАРАЛЛЕЛЬНЫЕ ЗАПРОСЫ
+# SEE.TG (KARTOSHKA.FREE) RESOLVER
 # ============================================================
 
 async def fetch_owner_from_seetg(slug: str) -> Dict[str, Any]:
@@ -1361,7 +1358,7 @@ def is_stars_only_listing(raw_gift: Any) -> bool:
 
 
 # ============================================================
-# MONITORING LOGIC (ТУРБО ПАРАЛЛЕЛЬНЫЙ ОБХОД)
+# MONITORING LOGIC
 # ============================================================
 
 async def get_monitor_models() -> List[BaseGift]:
@@ -2252,7 +2249,7 @@ async def claim_log_callback(callback: CallbackQuery):
 
 
 # ============================================================
-# УПРАВЛЕНИЕ ПУЛОМ АККАУНТОВ (ДОБАВЛЕНИЕ / УДАЛЕНИЕ)
+# УПРАВЛЕНИЕ ПУЛОМ АККАУНТОВ
 # ============================================================
 
 def accounts_menu_keyboard() -> InlineKeyboardMarkup:
